@@ -1,0 +1,79 @@
+preset_id: social_media_punchy
+name: "Social Media Punchy"
+emoji: "📱"
+description: "Яркий быстрый монтаж для Reels, Shorts, TikTok, промо, лайфстайла и коротких вирусных роликов."
+recommended_for:
+  - "Reels"
+  - "Shorts"
+  - "TikTok"
+  - "лайфстайл"
+  - "короткие проморолики"
+
+settings:
+  dynamic_level: fast
+  
+  clip_selection:
+    segment_min_duration: 0.8
+    segment_max_duration: 2.2
+  
+  transitions:
+    enabled: true
+    type: flash
+    duration: 0.2
+    randomize: true
+  
+  speed_effects:
+    enabled: true
+    mode: speed_up
+    slow_motion_factor: 0.7
+    speed_up_factor: 1.8
+    intensity: medium
+  
+  color:
+    enabled: true
+    style: punchy
+    intensity: high
+  
+  music_sync:
+    enabled: true
+    mode: beat_sync
+  
+  quality_filters:
+    enabled: true
+    remove_blurry: true
+    remove_dark: true
+    remove_shaky: true
+    stabilization: medium
+  
+  audio_selection:
+    enabled: true
+    mode: auto_highlight
+    manual_start: null
+    manual_end: null
+    avoid_intro: true
+    avoid_intro_seconds: 3.0
+    avoid_last_seconds: true
+    avoid_last_seconds_count: 3.0
+    analysis_window_sec: 6.0
+    hop_sec: 1.0
+    prefer_energy: true
+    prefer_stability: false
+    prefer_climax: true
+    fade_in: 0.4
+    fade_out: 0.7
+    loop_audio_if_short: true
+    fallback_mode: auto_energy
+  
+  framing:
+    output_format: vertical_9_16
+    resolution: "1080x1920"
+    fit_mode: fill
+    allow_crop: true
+    avoid_black_bars: true
+    crop_position: center
+  
+  export:
+    format: vertical_9_16
+    resolution: "1080x1920"
+    quality: balanced
+    hardware_acceleration: auto

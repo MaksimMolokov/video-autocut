@@ -1,0 +1,78 @@
+preset_id: drone_nature_cinematic
+name: "Drone Nature Cinematic"
+emoji: "🌄"
+description: "Кинематографичный спокойный монтаж для красивых дрон-видео природы, полей, лесов, рек и закатов."
+recommended_for:
+  - "дрон-съёмка природы"
+  - "поля, леса, горы, реки"
+  - "панорамные пролёты"
+  - "закаты и атмосферные пейзажи"
+
+settings:
+  dynamic_level: slow
+  
+  clip_selection:
+    segment_min_duration: 4.0
+    segment_max_duration: 9.0
+  
+  transitions:
+    enabled: true
+    type: crossfade
+    duration: 1.4
+    randomize: false
+  
+  speed_effects:
+    enabled: true
+    mode: slow_motion
+    slow_motion_factor: 0.75
+    speed_up_factor: 1.2
+    intensity: light  # normalized from "low"
+  
+  color:
+    enabled: true
+    style: cinematic_warm
+    intensity: medium
+  
+  music_sync:
+    enabled: true
+    mode: dynamic_sync
+  
+  quality_filters:
+    enabled: true
+    remove_blurry: true
+    remove_dark: true
+    remove_shaky: true
+    stabilization: medium
+  
+  audio_selection:
+    enabled: true
+    mode: auto_cinematic
+    manual_start: null
+    manual_end: null
+    avoid_intro: true
+    avoid_intro_seconds: 8.0
+    avoid_last_seconds: true
+    avoid_last_seconds_count: 6.0
+    analysis_window_sec: 12.0
+    hop_sec: 2.0
+    prefer_energy: false
+    prefer_stability: true
+    prefer_climax: false
+    fade_in: 2.0
+    fade_out: 2.5
+    loop_audio_if_short: true
+    fallback_mode: auto_balanced
+  
+  framing:
+    output_format: horizontal_16_9
+    resolution: "1920x1080"
+    fit_mode: fill
+    allow_crop: true
+    avoid_black_bars: true
+    crop_position: center
+  
+  export:
+    format: horizontal_16_9
+    resolution: "1920x1080"
+    quality: high
+    hardware_acceleration: auto

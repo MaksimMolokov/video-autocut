@@ -1,0 +1,20 @@
+project:
+  name: "Example Video Project"
+
+sources:
+  - path: "source1.mp4"
+    ranges:
+      - {start: 5.0, end: 15.0, type: "good"}
+      - {start: 20.0, end: 35.0, type: "must_use"}
+      - {start: 40.0, end: 50.0, type: "bad"}
+      - {start: 55.0, end: 70.0, type: "good"}
+
+output:
+  target_duration: 60  # seconds
+  format: "horizontal"  # horizontal | vertical | square
+  dynamic_level: "balanced"  # slow | balanced | fast
+
+music:
+  path: "background.mp3"
+  fade_in: 3.0
+  fade_out: 3.0

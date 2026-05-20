@@ -1,0 +1,79 @@
+preset_id: urban_city_rhythm
+name: "Urban City Rhythm"
+emoji: "🌆"
+description: "Ритмичный городской монтаж для улиц, архитектуры, машин, прогулок и динамики мегаполиса."
+recommended_for:
+  - "городские прогулки"
+  - "архитектура"
+  - "ночной город"
+  - "машины и улицы"
+  - "короткие вертикальные ролики"
+
+settings:
+  dynamic_level: fast
+  
+  clip_selection:
+    segment_min_duration: 1.2
+    segment_max_duration: 3.0
+  
+  transitions:
+    enabled: true
+    type: zoom
+    duration: 0.35
+    randomize: true
+  
+  speed_effects:
+    enabled: true
+    mode: speed_up
+    slow_motion_factor: 0.8
+    speed_up_factor: 1.6
+    intensity: medium
+  
+  color:
+    enabled: true
+    style: clean_contrast
+    intensity: medium
+  
+  music_sync:
+    enabled: true
+    mode: dynamic_sync
+  
+  quality_filters:
+    enabled: true
+    remove_blurry: true
+    remove_dark: true
+    remove_shaky: true
+    stabilization: medium
+  
+  audio_selection:
+    enabled: true
+    mode: auto_dynamic
+    manual_start: null
+    manual_end: null
+    avoid_intro: true
+    avoid_intro_seconds: 5.0
+    avoid_last_seconds: true
+    avoid_last_seconds_count: 4.0
+    analysis_window_sec: 8.0
+    hop_sec: 1.0
+    prefer_energy: true
+    prefer_stability: false
+    prefer_climax: false
+    fade_in: 0.8
+    fade_out: 1.0
+    loop_audio_if_short: true
+    fallback_mode: auto_balanced
+  
+  framing:
+    output_format: vertical_9_16
+    resolution: "1080x1920"
+    fit_mode: fill
+    allow_crop: true
+    avoid_black_bars: true
+    crop_position: center
+  
+  export:
+    format: vertical_9_16
+    resolution: "1080x1920"
+    quality: balanced
+    hardware_acceleration: auto

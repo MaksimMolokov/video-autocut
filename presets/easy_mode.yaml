@@ -1,0 +1,78 @@
+preset_id: easy_mode
+name: "Easy"
+emoji: "⚡"
+description: "Быстро создаёт ролик из случайных фрагментов видео, добавляет музыку и экспортирует результат без сложного анализа."
+recommended_for:
+  - "быстрый результат"
+  - "все типы видео"
+  - "простой монтаж"
+  - "Reels, TikTok, Shorts"
+
+settings:
+  dynamic_level: balanced
+
+  clip_selection:
+    segment_min_duration: 2.0
+    segment_max_duration: 5.0
+
+  transitions:
+    enabled: false
+    type: cut
+    duration: 0.0
+    randomize: false
+
+  speed_effects:
+    enabled: false
+    mode: none
+    slow_motion_factor: 1.0
+    speed_up_factor: 1.0
+    intensity: medium
+
+  color:
+    enabled: false
+    style: none
+    intensity: medium
+
+  music_sync:
+    enabled: false
+    mode: none
+
+  quality_filters:
+    enabled: false
+    remove_blurry: false
+    remove_dark: false
+    remove_shaky: false
+    stabilization: none
+
+  audio_selection:
+    enabled: true
+    mode: from_start
+    manual_start: null
+    manual_end: null
+    avoid_intro: false
+    avoid_intro_seconds: 0.0
+    avoid_last_seconds: false
+    avoid_last_seconds_count: 0.0
+    analysis_window_sec: 2.0
+    hop_sec: 0.5
+    prefer_energy: false
+    prefer_stability: false
+    prefer_climax: false
+    fade_in: 2.0
+    fade_out: 2.0
+    loop_audio_if_short: true
+    fallback_mode: from_start
+
+  framing:
+    output_format: vertical_9_16
+    resolution: "1080x1920"
+    fit_mode: fill
+    allow_crop: true
+    avoid_black_bars: true
+    crop_position: center
+
+  export:
+    format: vertical_9_16
+    resolution: "1080x1920"
+    quality: balanced
+    hardware_acceleration: auto
