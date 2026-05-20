@@ -203,6 +203,22 @@ if 'preprocess_pauses' not in st.session_state:
 if 'preprocess_text' not in st.session_state:
     st.session_state.preprocess_text = False
 
+# Draft / variants / preview state
+if 'draft_segments' not in st.session_state:
+    st.session_state.draft_segments = []       # segments proposed before render
+if 'approved_segments' not in st.session_state:
+    st.session_state.approved_segments = None  # approved after draft review
+if 'draft_deleted' not in st.session_state:
+    st.session_state.draft_deleted = set()     # indices deleted by user in draft
+if 'variant_seed_offset' not in st.session_state:
+    st.session_state.variant_seed_offset = 0   # 0=A 1=B 2=C 3=D
+if 'preview_path' not in st.session_state:
+    st.session_state.preview_path = None       # path to fast-preview file
+if '_draft_mode' not in st.session_state:
+    st.session_state._draft_mode = False
+if '_fast_preview_mode' not in st.session_state:
+    st.session_state._fast_preview_mode = False
+
 
 def add_render_log(message: str, level: str = 'INFO'):
     """Append a timestamped log entry to session state render_logs."""
@@ -279,7 +295,10 @@ def main():
     elif st.session_state.page == 'launch':
         show_launch_page()
     elif st.session_state.page == 'auto_render':
-        show_auto_render_screen()
+        if st.session_state.get('generation_status') == 'draft_ready':
+            show_draft_timeline()
+        else:
+            show_auto_render_screen()
     elif st.session_state.page == 'manual_settings':
         show_editor_screen()  # This has manual settings
     elif st.session_state.project_created:
@@ -288,6 +307,158 @@ def main():
     else:
         # Default to welcome
         show_welcome_screen()
+
+
+_VARIANT_LABELS = {0: 'A', 1: 'B', 2: 'C', 3: 'D'}
+
+
+def show_draft_timeline():
+    """
+    Draft timeline review — shown after clip selection, before any render.
+
+    Displays the proposed clip list.  User can delete clips, generate a new
+    variant (different seed), or proceed to fast-preview or final render.
+    """
+    hc1, hc2 = st.columns([1, 9])
+    with hc1:
+        if st.button("← Назад", key="back_from_draft"):
+            st.session_state.page = 'welcome'
+            st.session_state.generation_status = None
+            st.session_state.draft_segments = []
+            st.session_state.draft_deleted = set()
+            st.rerun()
+    with hc2:
+        variant_letter = _VARIANT_LABELS.get(st.session_state.variant_seed_offset, 'A')
+        st.markdown(f"#### 🎬 Черновой таймлайн  —  Вариант {variant_letter}")
+
+    segments = st.session_state.draft_segments
+    deleted  = st.session_state.draft_deleted   # set of int indices
+
+    if not segments:
+        st.warning("Нет предложенных клипов. Вернитесь назад и проверьте настройки.")
+        return
+
+    total_dur   = sum(s.duration for s in segments)
+    active_segs = [s for i, s in enumerate(segments) if i not in deleted]
+    active_dur  = sum(s.duration for s in active_segs)
+    target_dur  = st.session_state.get('target_duration', 0)
+
+    # ── Summary bar ──────────────────────────────────────────────────────────
+    m1, m2, m3 = st.columns(3)
+    with m1:
+        st.metric("Клипов выбрано", f"{len(active_segs)} / {len(segments)}")
+    with m2:
+        st.metric("Суммарная длина", f"{active_dur:.1f}с")
+    with m3:
+        pct = (active_dur / target_dur * 100) if target_dur else 0
+        color_note = "✅" if pct >= 90 else "⚠️"
+        st.metric("Покрытие цели", f"{color_note} {pct:.0f}%")
+
+    st.write("")
+
+    # ── Clip table ───────────────────────────────────────────────────────────
+    st.write("**Предложенные фрагменты** (снимите галочку, чтобы исключить)")
+
+    new_deleted = set()
+    for i, seg in enumerate(segments):
+        is_deleted = i in deleted
+        col_chk, col_num, col_file, col_range, col_dur, col_role = st.columns(
+            [0.5, 0.4, 3, 2.5, 1.2, 1.2]
+        )
+        with col_chk:
+            keep = st.checkbox(
+                "", value=not is_deleted,
+                key=f"draft_keep_{i}",
+                label_visibility="collapsed",
+            )
+            if not keep:
+                new_deleted.add(i)
+        with col_num:
+            st.caption(f"#{i+1}")
+        with col_file:
+            st.caption(Path(seg.source_path).name)
+        with col_range:
+            st.caption(f"{seg.start:.1f}s — {seg.end:.1f}s")
+        with col_dur:
+            st.caption(f"{seg.duration:.1f}с")
+        with col_role:
+            role = getattr(seg, 'role', 'body')
+            role_icons = {'intro': '🎬', 'outro': '🏁', 'body': '▶'}
+            st.caption(role_icons.get(role, '▶') + " " + role)
+
+    if new_deleted != deleted:
+        st.session_state.draft_deleted = new_deleted
+        st.rerun()
+
+    st.write("")
+    # ── Action buttons ───────────────────────────────────────────────────────
+    can_proceed = active_dur >= target_dur * 0.50  # need at least 50% coverage
+
+    b1, b2, b3, b4 = st.columns(4)
+
+    with b1:
+        next_offset = (st.session_state.variant_seed_offset + 1) % 4
+        next_letter = _VARIANT_LABELS[next_offset]
+        if st.button(
+            f"🔀 Вариант {next_letter}",
+            use_container_width=True,
+            help="Сгенерировать другой вариант клипов (другой seed)",
+        ):
+            st.session_state.variant_seed_offset = next_offset
+            st.session_state.draft_deleted = set()
+            st.session_state.draft_segments = []
+            st.session_state.approved_segments = None
+            st.session_state._draft_mode = True
+            st.session_state.generation_status = 'rendering'
+            st.rerun()
+
+    with b2:
+        if st.button(
+            "⚡ Быстрый preview",
+            use_container_width=True,
+            type="secondary",
+            disabled=not can_proceed,
+            help="Быстрый рендер 480p для проверки ритма (~10× быстрее финала)",
+        ):
+            final_segs = [s for i, s in enumerate(segments) if i not in new_deleted]
+            st.session_state.approved_segments = final_segs
+            st.session_state._fast_preview_mode = True
+            st.session_state._draft_mode = False
+            st.session_state.generation_status = 'rendering'
+            st.rerun()
+
+    with b3:
+        if st.button(
+            "🎬 Финальный рендер",
+            use_container_width=True,
+            type="primary",
+            disabled=not can_proceed,
+            help="Собрать финальное видео в полном качестве",
+        ):
+            final_segs = [s for i, s in enumerate(segments) if i not in new_deleted]
+            st.session_state.approved_segments = final_segs
+            st.session_state._fast_preview_mode = False
+            st.session_state._draft_mode = False
+            st.session_state.generation_status = 'rendering'
+            st.rerun()
+
+    with b4:
+        if st.button(
+            "↩ Изменить настройки",
+            use_container_width=True,
+        ):
+            st.session_state.page = 'welcome'
+            st.session_state.generation_status = None
+            st.session_state.draft_segments = []
+            st.session_state.draft_deleted = set()
+            st.rerun()
+
+    if not can_proceed:
+        st.warning(
+            f"⚠️ Активных фрагментов слишком мало ({active_dur:.1f}с). "
+            f"Нужно ≥ 50% цели ({target_dur * 0.5:.0f}с). "
+            f"Попробуйте другой вариант или добавьте видео."
+        )
 
 
 def show_preprocess_section(selected_videos: list):
@@ -1045,14 +1216,39 @@ def show_auto_render_screen():
         st.caption(f"📐 {fmt_labels.get(fmt, fmt)}")
 
         # Action buttons
-        if status in ('completed', 'failed'):
+        if status in ('completed', 'failed', 'preview_ready'):
             st.write("")
             if st.button("🎬 Сгенерировать заново", use_container_width=True, type="primary", key="regen_btn"):
                 st.session_state.generation_status = 'starting'
                 st.session_state.render_logs = []
                 st.session_state.render_progress = 0
                 st.session_state.render_stage = ''
+                st.session_state.draft_segments = []
+                st.session_state.approved_segments = None
+                st.session_state.draft_deleted = set()
+                st.session_state.variant_seed_offset = 0
                 st.rerun()
+
+            # Variant buttons
+            st.write("**🔀 Другой вариант**")
+            vc1, vc2, vc3 = st.columns(3)
+            cur_offset = st.session_state.get('variant_seed_offset', 0)
+            for col, (offset, letter) in zip([vc1, vc2, vc3],
+                                              [(o, _VARIANT_LABELS[o]) for o in range(4)
+                                               if o != cur_offset][:3]):
+                with col:
+                    if st.button(f"Вариант {letter}", key=f"variant_{letter}_btn",
+                                 use_container_width=True):
+                        st.session_state.variant_seed_offset = offset
+                        st.session_state.generation_status = 'starting'
+                        st.session_state.render_logs = []
+                        st.session_state.render_progress = 0
+                        st.session_state.render_stage = ''
+                        st.session_state.draft_segments = []
+                        st.session_state.approved_segments = None
+                        st.session_state.draft_deleted = set()
+                        st.rerun()
+
             if st.button("🎨 Изменить стиль", use_container_width=True, key="change_style_btn"):
                 st.session_state.page = 'welcome'
                 st.session_state.selected_preset_id = None
@@ -1122,10 +1318,16 @@ def show_auto_render_screen():
             add_render_log(f"Проект: {st.session_state.project_name}")
             add_render_log(f"Загружено видео: {len(video_files)}")
             add_render_log(f"Выходной файл: {output_name}")
+            variant_letter = _VARIANT_LABELS.get(
+                st.session_state.get('variant_seed_offset', 0), 'A'
+            )
             add_render_log(
                 f"[Init] Стиль={st.session_state.get('selected_preset_id')}  "
-                f"Длительность={st.session_state.get('target_duration')}s"
+                f"Длительность={st.session_state.get('target_duration')}s  "
+                f"Вариант={variant_letter}"
             )
+            # Enable draft mode so clip selection pauses for review
+            st.session_state._draft_mode = True
             st.session_state.generation_status = 'rendering'
             st.rerun()
 
@@ -1136,6 +1338,33 @@ def show_auto_render_screen():
             stage_txt = st.empty()
             stage_txt.caption(f"**{progress}%** — {stage}")
             render_video()
+
+        elif status == 'preview_ready':
+            st.info("⚡ Быстрый preview готов")
+            preview_path = st.session_state.get('preview_path')
+            if preview_path and Path(preview_path).exists():
+                p = Path(preview_path)
+                sz = p.stat().st_size / (1024 * 1024)
+                st.caption(f"480p preview · {sz:.1f} MB · {p.name}")
+                st.code(str(p), language=None)
+                if st.button("📂 Открыть папку", use_container_width=True, key="open_preview_folder"):
+                    os.system(f'open "{p.parent}"')
+
+            st.write("")
+            if st.button(
+                "🎬 Финальный рендер (полное качество)",
+                type="primary", use_container_width=True, key="final_from_preview_btn"
+            ):
+                st.session_state._fast_preview_mode = False
+                st.session_state.generation_status = 'rendering'
+                # approved_segments already set from draft review
+                st.session_state.render_logs = []
+                st.session_state.render_progress = 0
+                st.session_state.render_stage = ''
+                st.rerun()
+
+            st.write("**📋 Лог**")
+            show_render_log_block()
 
         elif status == 'completed':
             st.success("✅ Видео создано успешно!")
@@ -2271,6 +2500,19 @@ def render_video():
                     add_render_log(f"Без разметки: {video_info['name']} — используется целиком ({video_duration:.1f}s)")
                 sources.append({'path': video_path, 'ranges': ranges, 'duration': video_duration, 'name': video_info['name']})
 
+            # ── Approved segments shortcut (from draft review) ────────────────
+            _approved = st.session_state.get('approved_segments')
+            if _approved:
+                all_segments = _approved
+                st.session_state.approved_segments = None  # consume
+                add_render_log(
+                    f"Используются одобренные клипы из черновика: {len(all_segments)} фрагментов"
+                )
+                # Jump straight to effects + render
+                _skip_selection = True
+            else:
+                _skip_selection = False
+
             set_render_progress(15, "Настройка музыкальной синхронизации")
 
             # Music sync settings
@@ -2340,11 +2582,17 @@ def render_video():
                     add_render_log(f"AudioEngine failed: {e} — from start", 'WARNING')
                     audio_selection = None
 
-            # Clip selection
+            # Clip selection (skipped when approved_segments provided from draft)
             set_render_progress(50, "Выбор видеофрагментов")
             preset_id = st.session_state.get('selected_preset_id', 'manual')
 
-            if preset_id == 'easy_mode':
+            # Variant seed: A=0 B=1 C=2 D=3 → base seed + offset*997
+            _variant_offset = st.session_state.get('variant_seed_offset', 0)
+            _base_seed = 42 + _variant_offset * 997
+
+            if _skip_selection:
+                pass  # all_segments already set above
+            elif preset_id == 'easy_mode':
                 from src.easy_mode import EasyClipSelector
                 add_render_log("Easy mode: случайный подбор фрагментов")
                 easy_seed = (st.session_state.get('easy_seed_value', 42)
@@ -2389,6 +2637,7 @@ def render_video():
                                 project_dir=Path(pm.project_path) if hasattr(pm, 'project_path') else None,
                                 use_clip_selection=True,
                                 return_candidates=True,
+                                seed=_base_seed,
                             )
                             _all_candidates.extend(_cands)
                             add_render_log(
@@ -2518,6 +2767,55 @@ def render_video():
                     f"итоговое видео будет короче выбранной длительности.",
                     'WARNING'
                 )
+            # ── Draft mode: pause here and let user review the clip list ─────
+            if st.session_state.get('_draft_mode'):
+                st.session_state._draft_mode = False
+                st.session_state.draft_segments = list(all_segments)
+                st.session_state.draft_deleted = set()
+                st.session_state.generation_status = 'draft_ready'
+                st.session_state.rendering = False
+                add_render_log(
+                    f"Черновой таймлайн готов: {len(all_segments)} фрагментов — "
+                    f"ожидаем одобрения"
+                )
+                st.rerun()
+                return
+
+            # ── Fast preview mode: render 480p quickly ────────────────────────
+            if st.session_state.get('_fast_preview_mode'):
+                st.session_state._fast_preview_mode = False
+                _preview_name = f"preview_{st.session_state.output_name}"
+                _preview_path = pm.output_dir / _preview_name
+                _out_fmt_preview = st.session_state.get('output_format', 'horizontal')
+                _vert_mode_preview = st.session_state.get('vertical_mode', 'center_crop')
+                add_render_log("⚡ Быстрый preview рендер (480p)...")
+                set_render_progress(70, "Быстрый preview")
+                try:
+                    FFmpegRenderer.render_fast_preview(
+                        segments=all_segments,
+                        output_path=str(_preview_path),
+                        output_format=_out_fmt_preview,
+                        music_path=music_path,
+                        music_start_time=(audio_selection.start_time
+                                          if audio_selection else 0.0),
+                        vertical_mode=_vert_mode_preview,
+                        progress_callback=lambda msg, level='INFO': add_render_log(msg, level),
+                    )
+                    st.session_state.preview_path = str(_preview_path)
+                    st.session_state.approved_segments = list(all_segments)
+                    st.session_state.generation_status = 'preview_ready'
+                    add_render_log(f"Preview сохранён: {_preview_path.name}", 'SUCCESS')
+                except Exception as _prev_err:
+                    add_render_log(f"Preview ошибка: {_prev_err} — переходим к финалу",
+                                   'WARNING')
+                    st.session_state.approved_segments = list(all_segments)
+                    st.session_state.generation_status = 'rendering'
+                finally:
+                    st.session_state.rendering = False
+                    set_render_progress(100, "Готово")
+                    st.rerun()
+                return
+
             set_render_progress(65, "Настройка эффектов")
 
             # Effects

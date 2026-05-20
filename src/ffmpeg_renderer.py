@@ -867,6 +867,155 @@ class FFmpegRenderer:
             raise RuntimeError(f"Failed to get video duration: {e}")
 
     @staticmethod
+    def render_fast_preview(
+        segments: List[SelectedSegment],
+        output_path: str,
+        output_format: str = "horizontal",
+        music_path: Optional[str] = None,
+        music_start_time: float = 0.0,
+        vertical_mode: str = VERTICAL_MODE_CENTER_CROP,
+        progress_callback=None,
+    ) -> bool:
+        """
+        Fast low-resolution preview render — ~10x faster than final render.
+
+        Uses 480p, ultrafast preset, simple concat (no transitions), minimal
+        color processing. Suitable for checking rhythm and clip selection before
+        committing to a full-quality render.
+
+        Args:
+            segments:          Selected segments to preview.
+            output_path:       Output file path (.mp4).
+            output_format:     "horizontal" | "vertical" | "square"
+            music_path:        Optional background music.
+            music_start_time:  Music start offset in seconds.
+            vertical_mode:     Crop mode for vertical output.
+            progress_callback: Optional callable(str).
+
+        Returns:
+            True on success, False on failure.
+        """
+        if not segments:
+            return False
+
+        def _cb(msg):
+            if progress_callback:
+                try:
+                    progress_callback(msg)
+                except Exception:
+                    pass
+
+        # Preview resolutions (short side ≤ 480px)
+        preview_res = {
+            "horizontal": (854, 480),
+            "vertical":   (480, 854),
+            "square":     (480, 480),
+        }
+        width, height = preview_res.get(output_format, (854, 480))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            segment_files = []
+
+            _cb(f"[Preview] Extracting {len(segments)} segments at {width}×{height}…")
+            for i, seg in enumerate(segments):
+                out_seg = tmp_path / f"seg_{i:04d}.mp4"
+
+                # Build scale+crop filter for this segment
+                if output_format == "vertical" and vertical_mode == VERTICAL_MODE_FIT_BLUR:
+                    vf = (
+                        f"[0:v]split[main][blur];"
+                        f"[blur]scale={width}:{height}:force_original_aspect_ratio=increase,"
+                        f"crop={width}:{height},boxblur=20:5[bg];"
+                        f"[main]scale={width}:{height}:force_original_aspect_ratio=decrease[fg];"
+                        f"[bg][fg]overlay=(W-w)/2:(H-h)/2"
+                    )
+                else:
+                    vf = (
+                        f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+                        f"crop={width}:{height}"
+                    )
+
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-ss", f"{seg.start:.3f}",
+                    "-i", str(seg.source_path),
+                    "-t",  f"{seg.duration:.3f}",
+                    "-vf", vf,
+                    "-r",  "30",
+                    "-c:v", "libx264",
+                    "-preset", "ultrafast",
+                    "-crf",    "35",
+                    "-pix_fmt", "yuv420p",
+                    "-an",
+                    str(out_seg),
+                ]
+                try:
+                    subprocess.run(cmd, capture_output=True, timeout=120, check=True)
+                    segment_files.append(out_seg)
+                except subprocess.CalledProcessError as e:
+                    _cb(f"[Preview] Segment {i} failed, skipping: {e}")
+                except subprocess.TimeoutExpired:
+                    _cb(f"[Preview] Segment {i} timed out, skipping")
+
+            if not segment_files:
+                return False
+
+            # Concat
+            concat_list = tmp_path / "preview_concat.txt"
+            with open(concat_list, "w") as f:
+                for sf in segment_files:
+                    f.write(f"file '{sf}'\n")
+
+            video_silent = tmp_path / "preview_silent.mp4"
+            _cb("[Preview] Concatenating…")
+            try:
+                subprocess.run(
+                    [
+                        "ffmpeg", "-y",
+                        "-f", "concat", "-safe", "0",
+                        "-i", str(concat_list),
+                        "-c", "copy",
+                        str(video_silent),
+                    ],
+                    capture_output=True, timeout=120, check=True,
+                )
+            except subprocess.CalledProcessError:
+                return False
+
+            # Add music (simple mix, no fade processing)
+            if music_path and Path(music_path).exists():
+                video_dur = sum(s.duration for s in segments)
+                _cb("[Preview] Adding music…")
+                try:
+                    subprocess.run(
+                        [
+                            "ffmpeg", "-y",
+                            "-i", str(video_silent),
+                            "-ss", f"{music_start_time:.3f}",
+                            "-i", str(music_path),
+                            "-map", "0:v",
+                            "-map", "1:a",
+                            "-c:v", "copy",
+                            "-c:a", "aac", "-b:a", "96k",
+                            "-t",   f"{video_dur:.3f}",
+                            "-shortest",
+                            str(output_path),
+                        ],
+                        capture_output=True, timeout=120, check=True,
+                    )
+                except subprocess.CalledProcessError:
+                    # fallback: no audio
+                    import shutil
+                    shutil.copy2(str(video_silent), str(output_path))
+            else:
+                import shutil
+                shutil.copy2(str(video_silent), str(output_path))
+
+        _cb(f"[Preview] Done → {output_path}")
+        return Path(output_path).exists()
+
+    @staticmethod
     def generate_preview_command(
         segments: List[SelectedSegment],
         output_config: OutputConfig
