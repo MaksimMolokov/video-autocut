@@ -1,0 +1,81 @@
+preset_id: f3
+name: "F3 Urban Pulse Cut"
+emoji: "🏙"
+description: "Быстрый социальный монтаж в городском стиле с beat cuts, jump cuts и retention-ритмом."
+recommended_for:
+  - "city"
+  - "lifestyle"
+  - "cars"
+  - "cafe"
+  - "event"
+  - "social media"
+  - "street"
+
+settings:
+  dynamic_level: fast
+
+  clip_selection:
+    segment_min_duration: 0.9
+    segment_max_duration: 2.2
+
+  transitions:
+    enabled: true
+    type: flash
+    duration: 0.12
+    randomize: true
+
+  speed_effects:
+    enabled: true
+    mode: speed_ramp
+    slow_motion_factor: 0.75
+    speed_up_factor: 2.0
+    intensity: high
+
+  color:
+    enabled: true
+    style: high_contrast
+    intensity: medium
+
+  music_sync:
+    enabled: true
+    mode: beat_sync
+
+  quality_filters:
+    enabled: true
+    remove_blurry: true
+    remove_dark: true
+    remove_shaky: false
+    stabilization: light
+
+  audio_selection:
+    enabled: true
+    mode: auto_energy
+    manual_start: null
+    manual_end: null
+    avoid_intro: true
+    avoid_intro_seconds: 3.0
+    avoid_last_seconds: true
+    avoid_last_seconds_count: 3.0
+    analysis_window_sec: 5.0
+    hop_sec: 1.0
+    prefer_energy: true
+    prefer_stability: false
+    prefer_climax: true
+    fade_in: 0.4
+    fade_out: 0.8
+    loop_audio_if_short: true
+    fallback_mode: auto_balanced
+
+  framing:
+    output_format: horizontal_16_9
+    resolution: "1920x1080"
+    fit_mode: fill
+    allow_crop: true
+    avoid_black_bars: true
+    crop_position: center
+
+  export:
+    format: horizontal_16_9
+    resolution: "1920x1080"
+    quality: high
+    hardware_acceleration: auto

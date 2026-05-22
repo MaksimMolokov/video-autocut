@@ -20,6 +20,12 @@ from .strategies import (
     CalmDocumentaryStrategy,
     SportDynamicCutStrategy,
     SportHighlightImpactStrategy,
+    F1Strategy,
+    F2Strategy,
+    F3Strategy,
+    F4Strategy,
+    F5Strategy,
+    F6Strategy,
 )
 
 logger = logging.getLogger(__name__)
@@ -68,6 +74,24 @@ class StrategyRegistry:
         # Sport
         'sport_dynamic_cut':     SportDynamicCutStrategy,
         'sport_highlight_impact': SportHighlightImpactStrategy,
+
+        # F1 — ultra-dynamic beat-driven montage
+        'f1': F1Strategy,
+
+        # F2 — cinematic velocity flow
+        'f2': F2Strategy,
+
+        # F3 — urban pulse cut
+        'f3': F3Strategy,
+
+        # F4 — impact sport machine
+        'f4': F4Strategy,
+
+        # F5 — premium brand smooth
+        'f5': F5Strategy,
+
+        # F6 — dream travel atmosphere
+        'f6': F6Strategy,
     }
 
     @classmethod

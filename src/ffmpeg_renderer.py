@@ -205,7 +205,12 @@ class FFmpegRenderer:
             return {}
 
     @staticmethod
-    def _build_video_filter(out_w: int, out_h: int, vertical_mode: str) -> str:
+    def _build_video_filter(
+        out_w: int,
+        out_h: int,
+        vertical_mode: str,
+        face_center_x: float = 0.5,
+    ) -> str:
         """
         Build the -vf filter string for segment extraction.
 
@@ -218,6 +223,10 @@ class FFmpegRenderer:
           left_crop    — scale to fill, crop from left
           right_crop   — scale to fill, crop from right
           fit_blur     — sentinel: caller must use _build_filter_complex_blur()
+
+        face_center_x: normalized horizontal face position (0=left, 1=right).
+          When in center_crop mode and face_center_x != 0.5, the crop is
+          shifted toward the face so the subject stays in frame.
 
         All crop expressions use FFmpeg's runtime variables (iw, ow) so they
         work correctly regardless of the actual source resolution.
@@ -238,8 +247,16 @@ class FFmpegRenderer:
         elif vertical_mode == VERTICAL_MODE_RIGHT_CROP:
             crop_x = "iw-ow"
         else:
-            # center_crop and any unrecognised mode → crop centre
-            crop_x = "(iw-ow)/2"
+            # center_crop: shift crop toward detected face when available
+            if abs(face_center_x - 0.5) > 0.08:
+                # face_center_x is in normalized [0,1] of the SCALED frame.
+                # After scaling, frame width = out_w * (source_ar / target_ar).
+                # We approximate: shift = (face_center_x - 0.5) * (iw - ow)
+                # Use FFmpeg ternary to clamp between 0 and iw-ow.
+                shift_ratio = max(-0.45, min(0.45, face_center_x - 0.5))
+                crop_x = f"clip((iw-ow)/2+{shift_ratio:.4f}*(iw-ow),0,iw-ow)"
+            else:
+                crop_x = "(iw-ow)/2"
 
         return (
             f"scale={out_w}:{out_h}:force_original_aspect_ratio=increase,"
@@ -432,7 +449,17 @@ class FFmpegRenderer:
                 "-an",
             ]
 
-            vf = FFmpegRenderer._build_video_filter(width, height, vertical_mode)
+            # Smart reframing: use face_center_x from segment features if available
+            _face_cx = 0.5
+            try:
+                from src.video_analysis.candidate_builder import CandidateClip
+                if hasattr(seg, '_candidate') and seg._candidate is not None:
+                    f = seg._candidate.features
+                    if f is not None:
+                        _face_cx = getattr(f, 'face_center_x', 0.5)
+            except Exception:
+                pass
+            vf = FFmpegRenderer._build_video_filter(width, height, vertical_mode, _face_cx)
 
             # Per-segment visual transitions (intro fade-in / outro fade-out).
             seg_role = getattr(seg, 'role', 'body')
@@ -1014,6 +1041,192 @@ class FFmpegRenderer:
 
         _cb(f"[Preview] Done → {output_path}")
         return Path(output_path).exists()
+
+    # ------------------------------------------------------------------
+    # Post-render utilities
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def extract_thumbnail(
+        video_path: str,
+        output_path: str,
+        timestamp: Optional[float] = None,
+    ) -> bool:
+        """
+        Extract a single frame from *video_path* and save it as a JPEG thumbnail.
+        If *timestamp* is None, seeks to 5% into the video (auto-picks a frame
+        that avoids the black/fade at the very start).
+        Returns True on success.
+        """
+        try:
+            if timestamp is None:
+                # Probe duration then pick 5%
+                probe = subprocess.run(
+                    ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                     "-show_entries", "format=duration",
+                     "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)],
+                    capture_output=True, text=True, timeout=10,
+                )
+                try:
+                    dur = float(probe.stdout.strip())
+                except (ValueError, TypeError):
+                    dur = 10.0
+                timestamp = max(0.1, dur * 0.05)
+
+            result = subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-ss", f"{timestamp:.3f}",
+                    "-i", str(video_path),
+                    "-vframes", "1",
+                    "-vf", "scale=1280:-1",
+                    "-q:v", "3",
+                    str(output_path),
+                ],
+                capture_output=True, timeout=30,
+            )
+            return result.returncode == 0 and Path(output_path).exists()
+        except Exception as e:
+            logger.warning(f"extract_thumbnail failed: {e}")
+            return False
+
+    @staticmethod
+    def apply_watermark(
+        video_path: str,
+        output_path: str,
+        text: Optional[str] = None,
+        image_path: Optional[str] = None,
+        position: str = "bottom_right",
+        opacity: float = 0.7,
+        font_size: int = 36,
+    ) -> bool:
+        """
+        Add a text or image watermark to *video_path* and save to *output_path*.
+        *position*: top_left | top_right | bottom_left | bottom_right | center
+        Returns True on success.  Either *text* or *image_path* must be provided.
+        """
+        if not text and not image_path:
+            raise ValueError("Provide text or image_path for watermark")
+
+        _positions = {
+            "top_left":     ("10",          "10"),
+            "top_right":    ("W-w-10",      "10"),
+            "bottom_left":  ("10",          "H-h-10"),
+            "bottom_right": ("W-w-10",      "H-h-10"),
+            "center":       ("(W-w)/2",     "(H-h)/2"),
+        }
+        px, py = _positions.get(position, _positions["bottom_right"])
+
+        try:
+            if text:
+                # Escape special chars for drawtext
+                safe_text = text.replace("'", "\\'").replace(":", "\\:")
+                vf = (
+                    f"drawtext=text='{safe_text}':"
+                    f"fontsize={font_size}:"
+                    f"fontcolor=white@{opacity}:"
+                    f"shadowcolor=black@0.5:shadowx=2:shadowy=2:"
+                    f"x={px}:y={py}"
+                )
+            else:
+                vf = (
+                    f"movie='{image_path}'[wm];"
+                    f"[in][wm]overlay={px}:{py}:alpha=premultiplied"
+                )
+
+            result = subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-i", str(video_path),
+                    "-vf", vf,
+                    "-c:a", "copy",
+                    "-preset", "fast",
+                    str(output_path),
+                ],
+                capture_output=True, timeout=600,
+            )
+            return result.returncode == 0
+        except Exception as e:
+            logger.warning(f"apply_watermark failed: {e}")
+            return False
+
+    @staticmethod
+    def check_stabilization_available() -> bool:
+        """Return True if libvidstab is available in the local ffmpeg build."""
+        try:
+            result = subprocess.run(
+                ["ffmpeg", "-filters"],
+                capture_output=True, text=True, timeout=10,
+            )
+            return "vidstabdetect" in result.stdout
+        except Exception:
+            return False
+
+    @staticmethod
+    def stabilize_video(
+        input_path: str,
+        output_path: str,
+        shakiness: int = 5,
+        smoothing: int = 15,
+        progress_callback=None,
+    ) -> bool:
+        """
+        Two-pass video stabilization using libvidstab.
+        Returns True on success.  Requires ffmpeg built with libvidstab.
+        """
+        def _cb(msg):
+            if progress_callback:
+                try:
+                    progress_callback(msg)
+                except Exception:
+                    pass
+
+        if not FFmpegRenderer.check_stabilization_available():
+            _cb("[Stabilize] libvidstab not available — skipping")
+            return False
+
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                transforms = Path(tmp) / "transforms.trf"
+
+                # Pass 1: detect
+                _cb("[Stabilize] Pass 1: motion detection…")
+                r1 = subprocess.run(
+                    [
+                        "ffmpeg", "-y",
+                        "-i", str(input_path),
+                        "-vf", f"vidstabdetect=shakiness={shakiness}:accuracy=15"
+                              f":result={transforms}",
+                        "-f", "null", "-",
+                    ],
+                    capture_output=True, timeout=600,
+                )
+                if r1.returncode != 0:
+                    _cb("[Stabilize] Pass 1 failed")
+                    return False
+
+                # Pass 2: transform
+                _cb("[Stabilize] Pass 2: stabilizing…")
+                r2 = subprocess.run(
+                    [
+                        "ffmpeg", "-y",
+                        "-i", str(input_path),
+                        "-vf", f"vidstabtransform=zoom=1:smoothing={smoothing}"
+                              f":input={transforms}",
+                        "-c:a", "copy",
+                        str(output_path),
+                    ],
+                    capture_output=True, timeout=600,
+                )
+                if r2.returncode != 0:
+                    _cb("[Stabilize] Pass 2 failed")
+                    return False
+
+            _cb(f"[Stabilize] Done → {output_path}")
+            return True
+        except Exception as e:
+            _cb(f"[Stabilize] Error: {e}")
+            return False
 
     @staticmethod
     def generate_preview_command(

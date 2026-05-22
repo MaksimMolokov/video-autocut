@@ -5,7 +5,8 @@ the per-style weights defined in IntroOutroProfile.
 
 from __future__ import annotations
 import logging
-from typing import List, Optional
+import random
+from typing import List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -116,40 +117,108 @@ class IntroOutroScorer:
         return blended
 
     @staticmethod
-    def pick_best_intro(candidates: list, profile, n: int = 1) -> list:
+    def pick_best_intro(
+        candidates: list,
+        profile,
+        n: int = 1,
+        excluded_ids: Optional[Set[str]] = None,
+        seed: int = 42,
+    ) -> list:
         """
         Return up to n candidates best suited to be intro segments.
-        Excludes candidates whose start_time is within skip_source_start_sec
-        of the source beginning.
+
+        excluded_ids: set of scene_id strings that must not be chosen
+                      (used to force variant B/C/D to use a different opening).
+        seed:         used to break score ties deterministically but differently per variant.
         """
         from .intro_outro_rules import VideoIntroRule
+        from .variant_constraints import scene_id as _sid
         skip = profile.video_intro.skip_source_start_sec
+        excl = excluded_ids or set()
+
         scored = []
         for c in candidates:
             if c.start <= skip:
+                continue
+            if _sid(c) in excl:
                 continue
             s = IntroOutroScorer.score_intro(c, profile)
             if s is not None:
                 scored.append((s, c))
+
+        if not scored and excl:
+            # Fallback: relax exclusion (accept same opening rather than no intro)
+            for c in candidates:
+                if c.start <= skip:
+                    continue
+                s = IntroOutroScorer.score_intro(c, profile)
+                if s is not None:
+                    scored.append((s, c))
+
+        # Sort by score descending, break ties with seeded shuffle
         scored.sort(key=lambda x: x[0], reverse=True)
-        return [c for _, c in scored[:n]]
+        rng = random.Random(seed)
+        # Shuffle groups within a ±0.02 band
+        result = []
+        i = 0
+        while i < len(scored):
+            j = i + 1
+            while j < len(scored) and abs(scored[j][0] - scored[i][0]) < 0.02:
+                j += 1
+            group = scored[i:j]
+            rng.shuffle(group)
+            result.extend(group)
+            i = j
+
+        return [c for _, c in result[:n]]
 
     @staticmethod
-    def pick_best_outro(candidates: list, profile, n: int = 1) -> list:
+    def pick_best_outro(
+        candidates: list,
+        profile,
+        n: int = 1,
+        excluded_ids: Optional[Set[str]] = None,
+        seed: int = 42,
+    ) -> list:
         """
         Return up to n candidates best suited to be outro segments.
-        Excludes candidates whose end is within skip_source_end_sec of the source end.
-        We do not know the source duration here, so we rely on the caller
-        having already pruned obvious 'camera going down' segments via forbidden tokens.
+
+        excluded_ids: set of scene_id strings that must not be chosen.
+        seed:         tie-breaking seed.
         """
+        from .variant_constraints import scene_id as _sid
         skip = profile.video_outro.skip_source_end_sec
+        excl = excluded_ids or set()
+
         scored = []
         for c in candidates:
-            # Exclude very-start clips that might have been intro candidates too.
             if c.start <= skip:
+                continue
+            if _sid(c) in excl:
                 continue
             s = IntroOutroScorer.score_outro(c, profile)
             if s is not None:
                 scored.append((s, c))
+
+        if not scored and excl:
+            for c in candidates:
+                if c.start <= skip:
+                    continue
+                s = IntroOutroScorer.score_outro(c, profile)
+                if s is not None:
+                    scored.append((s, c))
+
         scored.sort(key=lambda x: x[0], reverse=True)
-        return [c for _, c in scored[:n]]
+        rng = random.Random(seed + 1)
+        result = []
+        i = 0
+        while i < len(scored):
+            j = i + 1
+            while j < len(scored) and abs(scored[j][0] - scored[i][0]) < 0.02:
+                j += 1
+            group = scored[i:j]
+            rng.shuffle(group)
+            result.extend(group)
+            i = j
+
+        return [c for _, c in result[:n]]

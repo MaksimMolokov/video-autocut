@@ -5,6 +5,8 @@ Detects:
   camera_raise_lower  — camera being put down / picked up (dark + zero motion)
   technical_pause     — static scene with no meaningful motion
   text_overlay        — on-screen text / SMS / UI overlays (dense edges + still)
+  blurry              — out-of-focus footage (low Laplacian variance)
+  near_duplicate      — consecutive near-identical frames (histogram similarity)
 
 Output: good ranges (complement of detected bad segments) ready for the
 selection pipeline.
@@ -30,7 +32,7 @@ logger = logging.getLogger(__name__)
 class DetectedSegment:
     start: float
     end: float
-    problem_type: str   # 'camera_raise_lower' | 'technical_pause' | 'text_overlay'
+    problem_type: str   # 'camera_raise_lower' | 'technical_pause' | 'text_overlay' | 'blurry' | 'near_duplicate'
     confidence: float   # 0.0–1.0
 
 
@@ -50,6 +52,8 @@ class PreprocessOptions:
     detect_camera_moves: bool = True
     detect_pauses: bool = True
     detect_text: bool = False
+    detect_blurry: bool = False
+    detect_duplicates: bool = False
 
     # Detection thresholds
     dark_threshold: float = 0.10          # brightness below this → dark frame
@@ -59,6 +63,10 @@ class PreprocessOptions:
     text_edge_threshold: float = 0.14     # edge density above this → text candidate
     text_motion_max: float = 0.04         # max motion for a text frame
     text_min_duration: float = 0.5        # minimum text segment duration to flag
+    blur_threshold: float = 0.05          # sharpness below this (norm) → blurry frame
+    blur_min_duration: float = 1.0        # seconds of blurriness to flag
+    duplicate_similarity: float = 0.97    # histogram correlation above this → duplicate
+    duplicate_min_duration: float = 2.0   # seconds of near-identical frames to flag
 
     # Scan settings
     scan_fps: float = 3.0      # frames per second during scanning
@@ -139,6 +147,20 @@ class VideoPreprocessor:
             )
             detected.extend(segs)
 
+        if options.detect_blurry:
+            _cb(0.85, "Поиск размытых кадров...")
+            segs = VideoPreprocessor._detect_blurry(
+                frame_data, options.blur_threshold, options.blur_min_duration,
+            )
+            detected.extend(segs)
+
+        if options.detect_duplicates:
+            _cb(0.90, "Поиск дублирующихся кадров...")
+            segs = VideoPreprocessor._detect_near_duplicates(
+                frame_data, options.duplicate_similarity, options.duplicate_min_duration,
+            )
+            detected.extend(segs)
+
         _cb(0.95, "Формирование диапазонов...")
         bad_ranges = VideoPreprocessor._segments_to_ranges(detected, video_duration)
         good_ranges = VideoPreprocessor._invert_ranges(
@@ -150,6 +172,8 @@ class VideoPreprocessor:
             'camera_moves':   sum(1 for s in detected if s.problem_type == 'camera_raise_lower'),
             'pauses':         sum(1 for s in detected if s.problem_type == 'technical_pause'),
             'text_overlays':  sum(1 for s in detected if s.problem_type == 'text_overlay'),
+            'blurry':         sum(1 for s in detected if s.problem_type == 'blurry'),
+            'near_duplicates':sum(1 for s in detected if s.problem_type == 'near_duplicate'),
             'removed_seconds': round(video_duration - filtered_duration, 1),
             'good_segments':  len(good_ranges),
         }
@@ -157,7 +181,8 @@ class VideoPreprocessor:
         logger.info(
             f"[Preprocessor] {video_path}: "
             f"camera={stats['camera_moves']} pauses={stats['pauses']} "
-            f"text={stats['text_overlays']} removed={stats['removed_seconds']}s"
+            f"text={stats['text_overlays']} blurry={stats['blurry']} "
+            f"dups={stats['near_duplicates']} removed={stats['removed_seconds']}s"
         )
 
         _cb(1.0, "Готово")
@@ -194,7 +219,7 @@ class VideoPreprocessor:
         for ts in timestamps:
             frame = VideoPreprocessor._extract_frame(video_path, ts)
             if frame is None:
-                results.append({'t': ts, 'brightness': None, 'motion': None, 'edge_density': None})
+                results.append({'t': ts, 'brightness': None, 'motion': None, 'edge_density': None, 'sharpness': None, 'hist': None})
                 prev_gray = None
                 continue
 
@@ -218,11 +243,21 @@ class VideoPreprocessor:
                 except Exception:
                     motion = 0.0
 
+            # Sharpness (Laplacian variance, normalized)
+            sharpness_raw = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+            sharpness = min(1.0, sharpness_raw / 1000.0)
+
+            # Histogram for duplicate detection (normalized)
+            hist = cv2.calcHist([gray], [0], None, [64], [0, 256])
+            hist = cv2.normalize(hist, hist).flatten()
+
             results.append({
                 't': ts,
                 'brightness': brightness,
                 'motion': motion,
                 'edge_density': edge_density,
+                'sharpness': sharpness,
+                'hist': hist,
             })
             prev_gray = gray.copy()
 
@@ -311,6 +346,87 @@ class VideoPreprocessor:
             min_dur=min_dur,
             confidence_fn=lambda fd: min(1.0, fd['edge_density'] / max(edge_thresh, 1e-6)),
         )
+
+    @staticmethod
+    def _detect_blurry(
+        frame_data: list,
+        blur_thresh: float,
+        min_dur: float,
+    ) -> List[DetectedSegment]:
+        """Low sharpness sustained segments → out-of-focus / blurry footage."""
+        return VideoPreprocessor._run_detector(
+            frame_data,
+            condition=lambda fd: (
+                fd.get('sharpness') is not None
+                and fd['sharpness'] < blur_thresh
+            ),
+            problem_type='blurry',
+            min_dur=min_dur,
+            confidence_fn=lambda fd: min(1.0, 1.0 - fd['sharpness'] / max(blur_thresh, 1e-6)),
+        )
+
+    @staticmethod
+    def _detect_near_duplicates(
+        frame_data: list,
+        similarity_thresh: float,
+        min_dur: float,
+    ) -> List[DetectedSegment]:
+        """
+        Consecutive frames with very high histogram correlation →
+        near-duplicate / frozen footage (different from technical_pause:
+        the scene can be bright and have small texture but no real change).
+        """
+        segments = []
+        in_seg = False
+        seg_start = 0.0
+        prev_hist = None
+
+        for fd in frame_data:
+            hist = fd.get('hist')
+            if hist is None or prev_hist is None:
+                if in_seg:
+                    dur = fd['t'] - seg_start
+                    if dur >= min_dur:
+                        segments.append(DetectedSegment(
+                            start=seg_start, end=fd['t'],
+                            problem_type='near_duplicate',
+                            confidence=0.85,
+                        ))
+                in_seg = False
+                prev_hist = hist
+                continue
+
+            corr = float(cv2.compareHist(prev_hist, hist, cv2.HISTCMP_CORREL))
+            is_dup = corr >= similarity_thresh
+
+            if is_dup:
+                if not in_seg:
+                    in_seg = True
+                    seg_start = fd['t']
+            else:
+                if in_seg:
+                    dur = fd['t'] - seg_start
+                    if dur >= min_dur:
+                        segments.append(DetectedSegment(
+                            start=seg_start, end=fd['t'],
+                            problem_type='near_duplicate',
+                            confidence=corr,
+                        ))
+                    in_seg = False
+
+            prev_hist = hist
+
+        if in_seg and frame_data:
+            last_t = frame_data[-1]['t']
+            dur = last_t - seg_start
+            if dur >= min_dur:
+                segments.append(DetectedSegment(
+                    start=seg_start, end=last_t,
+                    problem_type='near_duplicate',
+                    confidence=0.85,
+                ))
+
+        return segments
 
     @staticmethod
     def _run_detector(

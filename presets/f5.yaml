@@ -1,0 +1,81 @@
+preset_id: f5
+name: "F5 Premium Brand Smooth"
+emoji: "✨"
+description: "Дорогой премиальный стиль для бренда, кафе, недвижимости и интерьеров."
+recommended_for:
+  - "real estate"
+  - "cafe"
+  - "product"
+  - "interiors"
+  - "lifestyle"
+  - "hotel"
+  - "brand"
+
+settings:
+  dynamic_level: slow
+
+  clip_selection:
+    segment_min_duration: 2.8
+    segment_max_duration: 5.5
+
+  transitions:
+    enabled: true
+    type: crossfade
+    duration: 0.8
+    randomize: false
+
+  speed_effects:
+    enabled: true
+    mode: slow_motion
+    slow_motion_factor: 0.75
+    speed_up_factor: 1.2
+    intensity: light
+
+  color:
+    enabled: true
+    style: premium_soft
+    intensity: medium
+
+  music_sync:
+    enabled: true
+    mode: dynamic_sync
+
+  quality_filters:
+    enabled: true
+    remove_blurry: true
+    remove_dark: true
+    remove_shaky: true
+    stabilization: strong
+
+  audio_selection:
+    enabled: true
+    mode: auto_balanced
+    manual_start: null
+    manual_end: null
+    avoid_intro: true
+    avoid_intro_seconds: 8.0
+    avoid_last_seconds: true
+    avoid_last_seconds_count: 6.0
+    analysis_window_sec: 12.0
+    hop_sec: 2.0
+    prefer_energy: false
+    prefer_stability: true
+    prefer_climax: false
+    fade_in: 2.0
+    fade_out: 2.5
+    loop_audio_if_short: true
+    fallback_mode: auto_balanced
+
+  framing:
+    output_format: horizontal_16_9
+    resolution: "1920x1080"
+    fit_mode: fill
+    allow_crop: true
+    avoid_black_bars: true
+    crop_position: center
+
+  export:
+    format: horizontal_16_9
+    resolution: "1920x1080"
+    quality: high
+    hardware_acceleration: auto

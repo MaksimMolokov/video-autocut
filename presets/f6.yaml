@@ -1,0 +1,80 @@
+preset_id: f6
+name: "F6 Dream Travel Atmosphere"
+emoji: "🌅"
+description: "Атмосферный travel-монтаж с мягким ритмом, эмоцией и story-like flow."
+recommended_for:
+  - "travel"
+  - "nature"
+  - "lifestyle"
+  - "city walk"
+  - "drone scenic"
+  - "beach"
+
+settings:
+  dynamic_level: balanced
+
+  clip_selection:
+    segment_min_duration: 2.5
+    segment_max_duration: 5.0
+
+  transitions:
+    enabled: true
+    type: crossfade
+    duration: 0.9
+    randomize: false
+
+  speed_effects:
+    enabled: true
+    mode: slow_motion
+    slow_motion_factor: 0.7
+    speed_up_factor: 1.35
+    intensity: light
+
+  color:
+    enabled: true
+    style: saturated_travel
+    intensity: medium
+
+  music_sync:
+    enabled: true
+    mode: dynamic_sync
+
+  quality_filters:
+    enabled: true
+    remove_blurry: true
+    remove_dark: true
+    remove_shaky: true
+    stabilization: medium
+
+  audio_selection:
+    enabled: true
+    mode: auto_dynamic
+    manual_start: null
+    manual_end: null
+    avoid_intro: true
+    avoid_intro_seconds: 6.0
+    avoid_last_seconds: true
+    avoid_last_seconds_count: 5.0
+    analysis_window_sec: 10.0
+    hop_sec: 2.0
+    prefer_energy: true
+    prefer_stability: true
+    prefer_climax: false
+    fade_in: 1.5
+    fade_out: 2.0
+    loop_audio_if_short: true
+    fallback_mode: auto_balanced
+
+  framing:
+    output_format: horizontal_16_9
+    resolution: "1920x1080"
+    fit_mode: fill
+    allow_crop: true
+    avoid_black_bars: true
+    crop_position: center
+
+  export:
+    format: horizontal_16_9
+    resolution: "1920x1080"
+    quality: high
+    hardware_acceleration: auto

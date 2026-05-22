@@ -683,9 +683,34 @@ class SegmentSelector:
             # 6. Compute final scores
             candidates = ClipScorer.compute_final_scores(candidates)
 
-            # Early exit: return all scored candidates for TimelineBuilder
+            # Early exit: return all scored candidates for TimelineBuilder.
+            # Apply seed-based shuffle within ±0.06 score bands so that different
+            # variants (different seeds) get a different initial ordering even before
+            # apply_variant_scoring runs. Without this, the candidate list was
+            # 100% deterministic regardless of the seed argument.
             if return_candidates:
-                logger.info(f"[ClipSelection] Returning {len(candidates)} scored candidates")
+                if seed is not None:
+                    _scored_pairs = sorted(
+                        ((getattr(c, 'final_score', 0.0), c) for c in candidates),
+                        key=lambda x: x[0], reverse=True
+                    )
+                    _rng = random.Random(seed)
+                    _shuffled: list = []
+                    _i = 0
+                    while _i < len(_scored_pairs):
+                        _j = _i + 1
+                        while (_j < len(_scored_pairs)
+                               and abs(_scored_pairs[_j][0] - _scored_pairs[_i][0]) < 0.06):
+                            _j += 1
+                        _grp = [c for _, c in _scored_pairs[_i:_j]]
+                        _rng.shuffle(_grp)
+                        _shuffled.extend(_grp)
+                        _i = _j
+                    candidates = _shuffled
+                logger.info(
+                    f"[ClipSelection] Returning {len(candidates)} scored candidates"
+                    f" (seed={seed})"
+                )
                 return candidates
 
             # 7. Select with diversity
@@ -738,17 +763,19 @@ class SegmentSelector:
             if len(ordered) > 5:
                 logger.info(f"[ClipSelected] ... and {len(ordered) - 5} more clips")
 
-            # 10. Convert to SelectedSegment
-            result = [
-                SelectedSegment(
+            # 10. Convert to SelectedSegment (carry features + score for UI)
+            result = []
+            for clip in ordered:
+                seg = SelectedSegment(
                     source_path=clip.source_path,
                     start=clip.start,
                     end=clip.end,
                     duration=clip.duration,
-                    is_must_use=clip.is_must_use
+                    is_must_use=clip.is_must_use,
                 )
-                for clip in ordered
-            ]
+                seg._features = clip.features        # ClipFeatures for UI display
+                seg._final_score = clip.final_score  # float score for sorting/display
+                result.append(seg)
 
             # 11. Save to render history
             if project_dir:

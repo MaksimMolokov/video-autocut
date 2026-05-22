@@ -549,6 +549,184 @@ STYLE_PROFILES: Dict[str, IntroOutroProfile] = {
         narrative='buildup_impact',
     ),
 
+    # ── 15. F1 — Ultra-dynamic beat-driven montage ────────────────────────────
+    # The split-screen intro is generated separately by F1IntroRenderer.
+    # This profile governs the first/last clips of the *main edit* only.
+    "f1": IntroOutroProfile(
+        preset_id="f1",
+        video_intro=VideoIntroRule(
+            weights=_w(
+                motion_score=2.5, action_score=2.5, sharpness_score=1.0,
+                visual_complexity_score=1.1, brightness_score=0.8,
+                calm_score=-2.5, camera_stability_score=-0.5,
+            ),
+            forbidden=['black_frame', 'blur', 'camera_starting', 'low_motion', 'low_action'],
+            min_sharpness=0.20, min_brightness=0.10,
+            min_action=0.30, max_calm=0.25,
+            skip_source_start_sec=0.3,
+            start_transition='beat_flash', start_transition_duration=0.1,
+        ),
+        video_outro=VideoOutroRule(
+            weights=_w(
+                action_score=2.5, motion_score=2.0, sharpness_score=1.0,
+                visual_complexity_score=1.0, brightness_score=0.7,
+                calm_score=-2.5,
+            ),
+            forbidden=['black_frame', 'blur', 'camera_ending', 'low_action', 'low_motion'],
+            min_action=0.25,
+            skip_source_end_sec=0.3,
+            end_transition='flash_impact', end_transition_duration=0.1,
+        ),
+        audio_intro=AudioIntroRule(mode='drop_start', fade_in_sec=0.2,
+                                   avoid_first_sec=3.0, prefer_energy=True),
+        audio_outro=AudioOutroRule(mode='punch_end', fade_out_sec=0.4,
+                                   avoid_last_sec=3.0),
+        narrative='buildup_impact',
+    ),
+
+    # ── 16. F2 — Cinematic Velocity Flow ─────────────────────────────────────
+    "f2": IntroOutroProfile(
+        preset_id="f2",
+        video_intro=VideoIntroRule(
+            weights=_w(camera_stability_score=1.8, sharpness_score=1.6,
+                       brightness_score=1.2, visual_complexity_score=1.2,
+                       motion_score=1.0, calm_score=0.6,
+                       action_score=-0.4),
+            forbidden=['black_frame', 'blur', 'shaky', 'camera_starting', 'low_brightness'],
+            min_sharpness=0.25, min_brightness=0.18, min_stability=0.30,
+            skip_source_start_sec=1.0,
+            start_transition='cinematic_crossfade', start_transition_duration=0.8,
+        ),
+        video_outro=VideoOutroRule(
+            weights=_w(camera_stability_score=1.6, sharpness_score=1.5,
+                       brightness_score=1.2, visual_complexity_score=1.1,
+                       color_saturation_score=1.0, calm_score=0.8),
+            forbidden=['black_frame', 'blur', 'shaky', 'camera_ending'],
+            skip_source_end_sec=1.0,
+            end_transition='cinematic_fade', end_transition_duration=1.0,
+        ),
+        audio_intro=AudioIntroRule(mode='phrase_start', fade_in_sec=1.2,
+                                   avoid_first_sec=5.0, prefer_stability=True),
+        audio_outro=AudioOutroRule(mode='phrase_fade_end', fade_out_sec=1.5,
+                                   avoid_last_sec=5.0),
+        narrative='beauty_arc',
+    ),
+
+    # ── 17. F3 — Urban Pulse Cut ──────────────────────────────────────────────
+    "f3": IntroOutroProfile(
+        preset_id="f3",
+        video_intro=VideoIntroRule(
+            weights=_w(motion_score=1.8, action_score=1.6, visual_complexity_score=1.4,
+                       contrast_score=1.2, sharpness_score=1.2, brightness_score=0.9,
+                       calm_score=-1.0),
+            forbidden=['black_frame', 'blur', 'camera_starting', 'low_brightness', 'low_motion'],
+            min_sharpness=0.22, min_brightness=0.12, min_action=0.20, max_calm=0.60,
+            skip_source_start_sec=0.5,
+            start_transition='zoom_in', start_transition_duration=0.25,
+        ),
+        video_outro=VideoOutroRule(
+            weights=_w(motion_score=1.4, action_score=1.4, visual_complexity_score=1.4,
+                       contrast_score=1.2, sharpness_score=1.2),
+            forbidden=['black_frame', 'blur', 'camera_ending'],
+            min_action=0.15,
+            skip_source_end_sec=0.5,
+            end_transition='beat_cut', end_transition_duration=0.0,
+        ),
+        audio_intro=AudioIntroRule(mode='beat_start', fade_in_sec=0.4,
+                                   avoid_first_sec=3.0, prefer_energy=True),
+        audio_outro=AudioOutroRule(mode='punch_end', fade_out_sec=0.8,
+                                   avoid_last_sec=3.0),
+        narrative='energy_peak',
+    ),
+
+    # ── 18. F4 — Impact Sport Machine ────────────────────────────────────────
+    "f4": IntroOutroProfile(
+        preset_id="f4",
+        video_intro=VideoIntroRule(
+            weights=_w(motion_score=2.5, action_score=2.5, sharpness_score=1.2,
+                       visual_complexity_score=1.2, brightness_score=0.7,
+                       calm_score=-2.5, camera_stability_score=-0.5),
+            forbidden=['black_frame', 'blur', 'camera_starting', 'low_motion',
+                       'low_action', 'low_brightness'],
+            min_sharpness=0.18, min_brightness=0.10, min_action=0.30, max_calm=0.25,
+            skip_source_start_sec=0.3,
+            start_transition='beat_flash', start_transition_duration=0.1,
+        ),
+        video_outro=VideoOutroRule(
+            weights=_w(action_score=2.5, motion_score=2.2, sharpness_score=1.2,
+                       visual_complexity_score=1.2, calm_score=-2.0),
+            forbidden=['black_frame', 'blur', 'camera_ending', 'low_action', 'low_motion'],
+            min_action=0.28,
+            skip_source_end_sec=0.3,
+            end_transition='flash_impact', end_transition_duration=0.1,
+        ),
+        audio_intro=AudioIntroRule(mode='drop_start', fade_in_sec=0.15,
+                                   avoid_first_sec=2.0, prefer_energy=True),
+        audio_outro=AudioOutroRule(mode='punch_end', fade_out_sec=0.4,
+                                   avoid_last_sec=2.0),
+        narrative='buildup_impact',
+    ),
+
+    # ── 19. F5 — Premium Brand Smooth ────────────────────────────────────────
+    "f5": IntroOutroProfile(
+        preset_id="f5",
+        video_intro=VideoIntroRule(
+            weights=_w(sharpness_score=2.0, brightness_score=1.5,
+                       camera_stability_score=2.0, technical_quality_score=1.5,
+                       visual_complexity_score=1.2, color_saturation_score=1.0,
+                       calm_score=1.5, action_score=-0.8, motion_score=-0.3),
+            forbidden=['black_frame', 'blur', 'shaky', 'camera_starting',
+                       'low_brightness', 'high_motion'],
+            min_sharpness=0.30, min_brightness=0.22, min_stability=0.45, max_calm=1.0,
+            skip_source_start_sec=1.2,
+            start_transition='cinematic_crossfade', start_transition_duration=1.0,
+        ),
+        video_outro=VideoOutroRule(
+            weights=_w(sharpness_score=2.0, camera_stability_score=1.8,
+                       brightness_score=1.4, color_saturation_score=1.2,
+                       technical_quality_score=1.4, visual_complexity_score=1.0,
+                       calm_score=1.4),
+            forbidden=['black_frame', 'blur', 'shaky', 'camera_ending'],
+            min_sharpness=0.28, min_brightness=0.20,
+            skip_source_end_sec=1.2,
+            end_transition='cinematic_fade', end_transition_duration=1.5,
+        ),
+        audio_intro=AudioIntroRule(mode='phrase_start', fade_in_sec=2.0,
+                                   avoid_first_sec=8.0, prefer_stability=True),
+        audio_outro=AudioOutroRule(mode='phrase_fade_end', fade_out_sec=2.5,
+                                   avoid_last_sec=6.0),
+        narrative='beauty_arc',
+    ),
+
+    # ── 20. F6 — Dream Travel Atmosphere ─────────────────────────────────────
+    "f6": IntroOutroProfile(
+        preset_id="f6",
+        video_intro=VideoIntroRule(
+            weights=_w(sharpness_score=1.5, brightness_score=1.4,
+                       camera_stability_score=1.4, visual_complexity_score=1.4,
+                       color_saturation_score=1.2, uniqueness_score=1.6,
+                       motion_score=0.6, action_score=0.2, calm_score=0.6),
+            forbidden=['black_frame', 'blur', 'shaky', 'camera_starting', 'low_brightness'],
+            min_sharpness=0.22, min_brightness=0.15, min_stability=0.20,
+            skip_source_start_sec=1.0,
+            start_transition='fade_in', start_transition_duration=0.6,
+        ),
+        video_outro=VideoOutroRule(
+            weights=_w(sharpness_score=1.5, brightness_score=1.4,
+                       camera_stability_score=1.3, color_saturation_score=1.2,
+                       uniqueness_score=1.5, visual_complexity_score=1.2,
+                       calm_score=0.8),
+            forbidden=['black_frame', 'blur', 'shaky', 'camera_ending'],
+            skip_source_end_sec=1.0,
+            end_transition='fade_out', end_transition_duration=1.2,
+        ),
+        audio_intro=AudioIntroRule(mode='phrase_start', fade_in_sec=1.5,
+                                   avoid_first_sec=6.0, prefer_stability=True),
+        audio_outro=AudioOutroRule(mode='phrase_fade_end', fade_out_sec=2.0,
+                                   avoid_last_sec=5.0),
+        narrative='story_arc',
+    ),
+
     # ── 14. Sport Highlight Impact ─────────────────────────────────────────────
     "sport_highlight_impact": IntroOutroProfile(
         preset_id="sport_highlight_impact",

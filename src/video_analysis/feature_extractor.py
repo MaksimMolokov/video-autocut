@@ -49,6 +49,8 @@ class ClipFeatures:
 
     # Будет заполнено позже при diversity analysis
     uniqueness_score: float = 0.0       # Отличие от других клипов
+    interest_score: float = 0.0         # Composite "interestingness" — color richness + light quality + complexity
+    face_center_x: float = 0.5          # Normalized face/subject horizontal center for smart reframing (0=left, 1=right)
 
     def to_dict(self):
         """Convert to dictionary for JSON serialization"""
@@ -111,11 +113,27 @@ class VideoFeatureExtractor:
         """
         Извлечь признаки из видеофрагмента через ffmpeg fast-seek.
         Намного быстрее OpenCV для 4K видео на сетевых дисках.
+        Results are cached in SQLite to skip re-analysis on repeated runs.
         """
         try:
             duration = end_time - start_time
             if duration <= 0:
                 return None
+
+            # Check global SQLite cache before doing expensive extraction
+            try:
+                from src.analysis_cache import get_cache
+                _cache = get_cache()
+                if _cache is not None:
+                    cached = _cache.get(video_path, start_time, end_time)
+                    if cached is not None:
+                        logger.debug(
+                            f"Cache hit: {Path(video_path).name} "
+                            f"[{start_time:.1f}-{end_time:.1f}]"
+                        )
+                        return cached
+            except Exception:
+                _cache = None
 
             # Sample timestamps: start, middle, end of clip
             timestamps = [
@@ -147,13 +165,29 @@ class VideoFeatureExtractor:
             )
             clip_features = VideoFeatureExtractor.compute_composite_scores(clip_features)
 
+            # Detect face center on middle frame for smart reframing
+            _mid_idx = len(timestamps) // 2
+            _mid_frame = VideoFeatureExtractor._extract_frame_ffmpeg(
+                video_path, timestamps[_mid_idx], width=320
+            )
+            if _mid_frame is not None:
+                clip_features.face_center_x = VideoFeatureExtractor.detect_face_center(_mid_frame)
+
             logger.debug(
                 f"Extracted features for {Path(video_path).name} "
                 f"[{start_time:.1f}-{end_time:.1f}s]: "
                 f"motion={clip_features.motion_score:.2f} "
                 f"stability={clip_features.camera_stability_score:.2f} "
-                f"sharpness={clip_features.sharpness_score:.2f}"
+                f"sharpness={clip_features.sharpness_score:.2f} "
+                f"interest={clip_features.interest_score:.2f}"
             )
+
+            # Store in cache for future runs
+            try:
+                if _cache is not None:
+                    _cache.set(video_path, start_time, end_time, clip_features)
+            except Exception:
+                pass
 
             return clip_features
 
@@ -313,7 +347,36 @@ class VideoFeatureExtractor:
             0.0, 1.0
         )
 
+        # Interest score
+        _brightness_quality = 1.0 - abs(features.brightness_score - 0.45) * 2.0
+        _color_richness = features.color_saturation_score * 0.5 + features.color_diversity_score * 0.5
+        _motion_contrib = min(features.motion_score, 0.6) / 0.6
+        features.interest_score = float(np.clip(
+            _brightness_quality * 0.30 +
+            _color_richness * 0.30 +
+            features.visual_complexity_score * 0.25 +
+            _motion_contrib * 0.15,
+            0.0, 1.0,
+        ))
+
         return features
+
+    @staticmethod
+    def detect_face_center(frame: np.ndarray) -> float:
+        """Return normalized horizontal center of largest detected face, or 0.5 if none."""
+        try:
+            import cv2
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
+            cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+            cascade = cv2.CascadeClassifier(cascade_path)
+            faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(30, 30))
+            if len(faces) == 0:
+                return 0.5
+            largest = max(faces, key=lambda f: f[2] * f[3])
+            x, _, w, _ = largest
+            return float(np.clip((x + w / 2) / max(frame.shape[1], 1), 0.0, 1.0))
+        except Exception:
+            return 0.5
 
     @staticmethod
     def check_opencv_available() -> bool:
