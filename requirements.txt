@@ -3,4 +3,7 @@ streamlit>=1.28.0
 librosa>=0.10.0
 numpy>=1.24.0
 scipy>=1.10.0
-opencv-python>=4.8.0
+opencv-python==4.8.1.78
+
+# Preprocessing pipeline (MVP)
+scenedetect[opencv]>=0.6.3

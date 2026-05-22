@@ -1285,6 +1285,156 @@ def _dt_render_grid(
                         st.rerun()
 
 
+def _get_project_dir_from_videos(selected_videos: list) -> str:
+    """Derive project dir from selected video paths (common parent folder)."""
+    if not selected_videos:
+        return ''
+    return str(Path(selected_videos[0]).parent)
+
+
+def show_quality_analysis_section(selected_videos: list):
+    """
+    Quality analysis section: scene detection + technical metrics + thumbnail cache.
+    Shows cache status when already analyzed, progress bar during analysis,
+    and a fragment viewer after completion.
+    """
+    if not selected_videos:
+        return
+
+    project_dir = _get_project_dir_from_videos(selected_videos)
+    if not project_dir:
+        return
+
+    try:
+        from src.storage.analysis_db import AnalysisDB
+        from src.preprocessing.pipeline import analyze_project
+        db = AnalysisDB(project_dir)
+        stats = db.get_stats()
+    except Exception:
+        return
+
+    has_analysis = stats['analyzed_files'] > 0
+
+    if has_analysis:
+        import datetime
+        last = stats.get('last_analyzed', '')
+        time_ago = ''
+        if last:
+            try:
+                dt = datetime.datetime.fromisoformat(last)
+                delta = datetime.datetime.utcnow() - dt
+                h = int(delta.total_seconds() // 3600)
+                m = int((delta.total_seconds() % 3600) // 60)
+                time_ago = f'{h} ч {m} мин назад' if h else f'{m} мин назад'
+            except Exception:
+                pass
+        st.success(
+            f"✅ Материалы проанализированы · "
+            f"{stats['good_fragments']} удачных фрагментов · "
+            f"{stats['analyzed_files']}/{len(selected_videos)} файлов · "
+            f"{time_ago}"
+        )
+        col_view, col_reanalyze, _ = st.columns([2, 2, 3])
+        with col_view:
+            if st.button('📋 Посмотреть фрагменты', key='qa_view_btn', use_container_width=True):
+                st.session_state['show_fragment_viewer'] = True
+        with col_reanalyze:
+            if st.button('🔄 Обновить анализ', key='qa_reanalyze_btn', use_container_width=True):
+                st.session_state['qa_force_reanalyze'] = True
+                st.rerun()
+
+        if st.session_state.get('show_fragment_viewer'):
+            _show_fragment_viewer(project_dir, db)
+    else:
+        col_analyze, col_skip, _ = st.columns([2, 2, 3])
+        with col_analyze:
+            do_analyze = st.button(
+                '🔍 Анализировать материалы',
+                key='qa_analyze_btn',
+                type='primary',
+                use_container_width=True,
+            )
+        with col_skip:
+            st.caption('или пропустите — система сработает без анализа')
+
+        if do_analyze or st.session_state.get('qa_force_reanalyze'):
+            st.session_state.pop('qa_force_reanalyze', None)
+            progress_bar = st.progress(0.0)
+            status_text = st.empty()
+            frag_count = st.empty()
+
+            def _on_progress(filename: str, done: int, total: int):
+                progress_bar.progress(done / total)
+                status_text.text(f'Обработка: {filename}  ({done}/{total})')
+
+            try:
+                n = analyze_project(
+                    project_dir,
+                    progress_callback=_on_progress,
+                    force_reanalyze=st.session_state.get('qa_force_reanalyze', False),
+                )
+                progress_bar.empty()
+                status_text.empty()
+                st.rerun()
+            except Exception as e:
+                progress_bar.empty()
+                status_text.empty()
+                st.error(f'Ошибка анализа: {e}')
+
+
+def _show_fragment_viewer(project_dir: str, db=None):
+    """Thumbnail grid of analyzed fragments with approval controls."""
+    try:
+        from src.storage.analysis_db import AnalysisDB
+        from src.preprocessing.clip_library import FragmentLibrary
+        if db is None:
+            db = AnalysisDB(project_dir)
+        lib = FragmentLibrary(db)
+    except Exception as e:
+        st.warning(f'Не удалось загрузить фрагменты: {e}')
+        return
+
+    min_q = st.slider('Минимальное качество', 0.0, 1.0, 0.55, 0.05, key='fv_min_quality')
+    sort_opt = st.selectbox(
+        'Сортировка', ['quality_score', 'cinematic_score', 'action_score',
+                        'premium_score', 'travel_score'],
+        key='fv_sort',
+    )
+    fragments = lib.get_fragments_for_ui(min_quality=min_q, sort_by=sort_opt, limit=60)
+
+    if not fragments:
+        st.info('Нет фрагментов с указанным минимальным качеством.')
+        return
+
+    st.caption(f'Показано {len(fragments)} фрагментов')
+    cols = st.columns(4)
+    for i, f in enumerate(fragments):
+        with cols[i % 4]:
+            if f.thumbnail_path and Path(f.thumbnail_path).exists():
+                st.image(f.thumbnail_path)
+            else:
+                st.markdown('_(превью нет)_')
+            st.caption(
+                f'★ {f.quality_score:.2f}  |  {f.filename}\n'
+                f'{f.start_s:.1f}–{f.end_s:.1f}s  ({f.duration_s:.1f}s)'
+            )
+            b1, b2, b3 = st.columns(3)
+            with b1:
+                if st.button('✓', key=f'approve_{f.id}', help='Одобрить'):
+                    lib.mark_approved(f.id, True)
+                    st.rerun()
+            with b2:
+                if st.button('✗', key=f'disable_{f.id}', help='Отключить'):
+                    lib.mark_disabled(f.id)
+                    st.rerun()
+            with b3:
+                is_priority = bool(f.user_priority)
+                if st.button('★' if not is_priority else '☆',
+                             key=f'priority_{f.id}', help='Приоритет'):
+                    lib.mark_priority(f.id, not is_priority)
+                    st.rerun()
+
+
 def show_preprocess_section(selected_videos: list):
     """
     Optional pre-processing step — shown between video/audio selection and style.
@@ -1919,8 +2069,9 @@ def show_welcome_screen():
             current_pid or '',
         )
 
-    # ── Optional expanders (preprocessing, branding) ─────────────────────────
+    # ── Optional expanders (quality analysis, preprocessing, branding) ──────
     if st.session_state.selected_videos:
+        show_quality_analysis_section(st.session_state.selected_videos)
         show_preprocess_section(st.session_state.selected_videos)
     show_branding_section()
 
@@ -4217,6 +4368,33 @@ def render_video():
                         f" first_obj_ids={[id(c) for c in _all_candidates[:3]]}"
                         f" scores={[round(getattr(c,'final_score',0),3) for c in _all_candidates[:5]]}"
                     )
+
+                    # ── Merge preprocessing cache candidates (if available) ───
+                    try:
+                        _video_dirs = list({str(Path(s['path']).parent) for s in sources})
+                        for _vdir in _video_dirs:
+                            from src.storage.analysis_db import AnalysisDB as _ADB
+                            from src.preprocessing.clip_library import FragmentLibrary as _FL
+                            _pdb = _ADB(_vdir)
+                            _pstats = _pdb.get_stats()
+                            if _pstats['analyzed_files'] > 0:
+                                _style_key = f'{preset_id}_score' if preset_id else 'quality_score'
+                                _lib = _FL(_pdb)
+                                _pp_cands = _lib.get_all_candidates_for_project(
+                                    style_score_key=_style_key,
+                                    min_quality=0.50,
+                                    min_duration=float(getattr(st.session_state, 'min_clip_duration', 1.0) or 1.0),
+                                    max_duration=float(getattr(st.session_state, 'max_clip_duration', 10.0) or 10.0),
+                                    limit=300,
+                                )
+                                if _pp_cands:
+                                    _all_candidates.extend(_pp_cands)
+                                    add_render_log(
+                                        f'[Preprocessing] +{len(_pp_cands)} кандидатов из кэша '
+                                        f'({_vdir}), всего: {len(_all_candidates)}'
+                                    )
+                    except Exception as _pp_err:
+                        add_render_log(f'[Preprocessing] Кэш недоступен: {_pp_err}', 'DEBUG')
 
                     # ── Build structural variant constraints ──────────────────
                     _vconstraints = None
