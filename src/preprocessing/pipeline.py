@@ -113,6 +113,7 @@ def _analyze_one_video(
     previews_dir: str,
     enable_content_analysis: bool = True,
     enable_dedup: bool = True,
+    enable_video_preview: bool = True,
 ) -> dict:
     """
     Worker function — runs in a separate process.
@@ -168,6 +169,15 @@ def _analyze_one_video(
             thumb_path = previewer.generate_thumbnail(
                 video_path, scene.start_s, scene.end_s, frag_id
             )
+            # Video preview for scenes >= 2s (Level 3)
+            preview_path = None
+            if enable_video_preview and scene.duration_s >= 2.0:
+                try:
+                    preview_path = previewer.generate_video_preview(
+                        video_path, scene.start_s, scene.end_s, frag_id, max_duration=3.0
+                    )
+                except Exception as e:
+                    _log.debug(f'[Pipeline] Video preview scene {i}: {e}')
 
             # Compute phash for dedup
             phash = None
@@ -203,6 +213,7 @@ def _analyze_one_video(
                 'premium_score': scores.premium_score,
                 'travel_score': scores.travel_score,
                 'thumbnail_path': thumb_path or None,
+                'preview_path': preview_path or None,
                 'phash': phash,
             })
         except Exception as e:

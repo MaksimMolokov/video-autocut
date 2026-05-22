@@ -1462,7 +1462,10 @@ def _show_fragment_viewer(project_dir: str, db=None):
             elif approved == 0:
                 st.error('✗ отключён')
 
-            if f.thumbnail_path and Path(f.thumbnail_path).exists():
+            preview_path = getattr(f, 'preview_path', None)
+            if preview_path and Path(preview_path).exists():
+                st.video(preview_path)
+            elif f.thumbnail_path and Path(f.thumbnail_path).exists():
                 st.image(f.thumbnail_path)
             else:
                 st.markdown('🎞️ *(превью нет)*')

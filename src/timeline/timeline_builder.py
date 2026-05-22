@@ -321,15 +321,43 @@ class TimelineBuilder:
 
         selected = []
         total = 0.0
+        recent_scene_types: list = []   # rolling window of last 3 scene_types
+
         for c in reordered:
             if total + c.duration > budget * 1.15:
                 if total >= budget * 0.85:
                     break
                 continue
+
+            # Scene-type diversity soft penalty (Level 3)
+            scene_type = getattr(getattr(c, 'features', None), 'scene_type', None)
+            if scene_type and len(recent_scene_types) >= 2:
+                if recent_scene_types[-1] == scene_type and recent_scene_types[-2] == scene_type:
+                    # 3rd clip of same type in a row → skip unless nothing better
+                    # (we simply deprioritise by marking as lower-pri; still add if budget unfilled)
+                    if total < budget * 0.60:
+                        continue   # skip early; try to pick a different type
+
             selected.append(c)
             total += c.duration
+            recent_scene_types.append(scene_type)
+            if len(recent_scene_types) > 3:
+                recent_scene_types.pop(0)
             if total >= budget:
                 break
+
+        # If budget still unfilled after diversity filtering, do a second pass without it
+        if total < budget * 0.75:
+            used_ids = {id(c) for c in selected}
+            for c in reordered:
+                if id(c) in used_ids:
+                    continue
+                if total + c.duration > budget * 1.15:
+                    continue
+                selected.append(c)
+                total += c.duration
+                if total >= budget:
+                    break
 
         # Apply narrative ordering
         selected = TimelineBuilder._order_body(selected, narrative)

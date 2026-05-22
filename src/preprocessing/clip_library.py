@@ -36,6 +36,8 @@ class FragmentData:
     has_person: Optional[int] = None
     has_subject: Optional[int] = None
     scene_type: Optional[str] = None
+    # Level 3
+    preview_path: Optional[str] = None
 
 
 class FragmentLibrary:
@@ -187,6 +189,7 @@ class FragmentLibrary:
                 has_person=row['has_person'],
                 has_subject=row['has_subject'],
                 scene_type=row['scene_type'],
+                preview_path=row['preview_path'],
             ))
         return result
 
@@ -241,6 +244,10 @@ class FragmentLibrary:
             is_must_use=bool(row['user_priority']),
             final_score=row['quality_score'] or 0.5,
         )
+        # Attach scene_type for diversity logic in TimelineBuilder (Level 3)
+        scene_type = row['scene_type']
+        if scene_type:
+            candidate.features.scene_type = scene_type  # type: ignore[attr-defined]
         return candidate
 
 
