@@ -31,6 +31,11 @@ class FragmentData:
     thumbnail_path: Optional[str]
     user_approved: Optional[int]
     user_priority: Optional[int]
+    # Level 2 content fields (None if not yet analyzed)
+    has_face: Optional[int] = None
+    has_person: Optional[int] = None
+    has_subject: Optional[int] = None
+    scene_type: Optional[str] = None
 
 
 class FragmentLibrary:
@@ -178,6 +183,10 @@ class FragmentLibrary:
                 thumbnail_path=row['thumbnail_path'],
                 user_approved=row['user_approved'],
                 user_priority=row['user_priority'],
+                has_face=row['has_face'],
+                has_person=row['has_person'],
+                has_subject=row['has_subject'],
+                scene_type=row['scene_type'],
             ))
         return result
 

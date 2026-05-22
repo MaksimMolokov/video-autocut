@@ -1382,6 +1382,27 @@ def show_quality_analysis_section(selected_videos: list):
                 st.error(f'Ошибка анализа: {e}')
 
 
+def _fragment_tags(f) -> str:
+    """Build tag line for a fragment card based on content and motion metrics."""
+    tags = []
+    scene_type = getattr(f, 'scene_type', None) or ''
+    if scene_type == 'close':
+        tags.append('🔍 крупный')
+    elif scene_type == 'medium':
+        tags.append('📷 средний')
+    elif scene_type == 'wide':
+        tags.append('📷 широкий')
+    if getattr(f, 'has_face', None):
+        tags.append('👤 лицо')
+    if getattr(f, 'has_person', None) and not getattr(f, 'has_face', None):
+        tags.append('🧍 человек')
+    if getattr(f, 'motion', 0.0) > 0.4:
+        tags.append('⚡ движение')
+    if getattr(f, 'stability', 0.0) > 0.6:
+        tags.append('🎯 стабильно')
+    return '  '.join(tags)
+
+
 def _show_fragment_viewer(project_dir: str, db=None):
     """Thumbnail grid of analyzed fragments with approval controls."""
     try:
@@ -1394,30 +1415,65 @@ def _show_fragment_viewer(project_dir: str, db=None):
         st.warning(f'Не удалось загрузить фрагменты: {e}')
         return
 
-    min_q = st.slider('Минимальное качество', 0.0, 1.0, 0.55, 0.05, key='fv_min_quality')
-    sort_opt = st.selectbox(
-        'Сортировка', ['quality_score', 'cinematic_score', 'action_score',
-                        'premium_score', 'travel_score'],
-        key='fv_sort',
-    )
+    # Filters row
+    fcol1, fcol2, fcol3 = st.columns([2, 2, 3])
+    with fcol1:
+        min_q = st.slider('Минимальное качество', 0.0, 1.0, 0.40, 0.05, key='fv_min_quality')
+    with fcol2:
+        sort_opt = st.selectbox(
+            'Сортировка',
+            ['quality_score', 'cinematic_score', 'action_score', 'premium_score', 'travel_score'],
+            key='fv_sort',
+        )
+    with fcol3:
+        accept_col, reset_col = st.columns(2)
+        with accept_col:
+            if st.button('✓ Принять всё', key='fv_accept_all', use_container_width=True):
+                frags_all = lib.get_fragments_for_ui(min_quality=0.0, limit=500)
+                for _f in frags_all:
+                    lib.mark_approved(_f.id, True)
+                st.rerun()
+        with reset_col:
+            if st.button('↩ Сбросить', key='fv_reset_all', use_container_width=True):
+                frags_all = lib.get_fragments_for_ui(min_quality=0.0, limit=500)
+                for _f in frags_all:
+                    lib.reset_approval(_f.id)
+                st.rerun()
+
     fragments = lib.get_fragments_for_ui(min_quality=min_q, sort_by=sort_opt, limit=60)
 
     if not fragments:
         st.info('Нет фрагментов с указанным минимальным качеством.')
         return
 
-    st.caption(f'Показано {len(fragments)} фрагментов')
+    stats = db.get_stats()
+    st.caption(
+        f'Показано {len(fragments)} из {stats["total_fragments"]} фрагментов  '
+        f'(удачных: {stats["good_fragments"]})'
+    )
+
     cols = st.columns(4)
     for i, f in enumerate(fragments):
         with cols[i % 4]:
+            # Approval border indicator
+            approved = f.user_approved
+            if approved == 1:
+                st.success('✓ одобрен')
+            elif approved == 0:
+                st.error('✗ отключён')
+
             if f.thumbnail_path and Path(f.thumbnail_path).exists():
                 st.image(f.thumbnail_path)
             else:
-                st.markdown('_(превью нет)_')
+                st.markdown('🎞️ *(превью нет)*')
+
+            tags_line = _fragment_tags(f)
             st.caption(
-                f'★ {f.quality_score:.2f}  |  {f.filename}\n'
+                f'★ {f.quality_score:.2f}  ·  {f.filename}\n'
                 f'{f.start_s:.1f}–{f.end_s:.1f}s  ({f.duration_s:.1f}s)'
+                + (f'\n{tags_line}' if tags_line else '')
             )
+
             b1, b2, b3 = st.columns(3)
             with b1:
                 if st.button('✓', key=f'approve_{f.id}', help='Одобрить'):
@@ -1429,8 +1485,8 @@ def _show_fragment_viewer(project_dir: str, db=None):
                     st.rerun()
             with b3:
                 is_priority = bool(f.user_priority)
-                if st.button('★' if not is_priority else '☆',
-                             key=f'priority_{f.id}', help='Приоритет'):
+                lbl = '★' if not is_priority else '☆'
+                if st.button(lbl, key=f'priority_{f.id}', help='Приоритет'):
                     lib.mark_priority(f.id, not is_priority)
                     st.rerun()
 

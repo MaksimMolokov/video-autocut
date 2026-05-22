@@ -6,4 +6,9 @@ scipy>=1.10.0
 opencv-python==4.8.1.78
 
 # Preprocessing pipeline (MVP)
-scenedetect[opencv]>=0.6.3
+scenedetect>=0.6.3
+
+# Level 2: content analysis + deduplication
+mediapipe>=0.10.0
+imagehash>=4.3.1
+Pillow>=10.0.0

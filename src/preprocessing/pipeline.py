@@ -108,28 +108,45 @@ def analyze_project(
     return good
 
 
-def _analyze_one_video(video_path: str, previews_dir: str) -> dict:
+def _analyze_one_video(
+    video_path: str,
+    previews_dir: str,
+    enable_content_analysis: bool = True,
+    enable_dedup: bool = True,
+) -> dict:
     """
     Worker function — runs in a separate process.
     All imports are local to ensure picklability.
     """
-    import subprocess
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+
     from src.preprocessing.scene_detector import SceneDetector
     from src.preprocessing.quality_analyzer import QualityAnalyzer
     from src.preprocessing.clip_scorer import ClipScorer
     from src.preprocessing.preview_generator import PreviewGenerator
+    from src.preprocessing.duplicate_detector import DuplicateDetector, compute_phash
+
+    # Try to import content analyzer (optional, may be unavailable)
+    content_analyzer = None
+    if enable_content_analysis:
+        try:
+            from src.preprocessing.content_analyzer import ContentAnalyzer
+            content_analyzer = ContentAnalyzer(n_frames=3)
+        except Exception as e:
+            _log.warning(f'[Pipeline] ContentAnalyzer unavailable: {e}')
 
     detector = SceneDetector()
     analyzer = QualityAnalyzer()
     scorer = ClipScorer()
     previewer = PreviewGenerator(previews_dir)
+    dedup = DuplicateDetector() if enable_dedup else None
 
-    # Get video metadata
     duration_s, fps, resolution = _get_video_meta(video_path)
 
     scenes = detector.split(video_path)
     fragments = []
-    frag_counter = abs(hash(video_path)) % 10_000_000  # unique-ish base id for filenames
+    frag_counter = abs(hash(video_path)) % 10_000_000
 
     for i, scene in enumerate(scenes):
         try:
@@ -137,12 +154,28 @@ def _analyze_one_video(video_path: str, previews_dir: str) -> dict:
             if metrics.is_rejected:
                 continue
 
-            scores = scorer.score(metrics)
+            # Content analysis (Level 2)
+            content = None
+            if content_analyzer is not None:
+                try:
+                    content = content_analyzer.analyze(video_path, scene)
+                except Exception as e:
+                    _log.debug(f'[Pipeline] Content analysis scene {i}: {e}')
+
+            scores = scorer.score(metrics, content)
 
             frag_id = frag_counter + i
             thumb_path = previewer.generate_thumbnail(
                 video_path, scene.start_s, scene.end_s, frag_id
             )
+
+            # Compute phash for dedup
+            phash = None
+            if dedup is not None:
+                try:
+                    phash = dedup.extract_hash(video_path, scene.start_s, scene.end_s)
+                except Exception:
+                    pass
 
             fragments.append({
                 'start_s': scene.start_s,
@@ -155,6 +188,13 @@ def _analyze_one_video(video_path: str, previews_dir: str) -> dict:
                 'stability': metrics.stability,
                 'action': metrics.action,
                 'calm': metrics.calm,
+                # Content fields (None if content analyzer unavailable)
+                'has_face': int(content.has_face) if content else None,
+                'has_person': int(content.has_person) if content else None,
+                'has_subject': int(content.has_subject) if content else None,
+                'scene_type': content.scene_type if content else None,
+                'crop_9_16': content.crop_9_16 if content else None,
+                # Scores
                 'is_duplicate': False,
                 'quality_score': scores.quality_score,
                 'cinematic_score': scores.cinematic_score,
@@ -163,13 +203,21 @@ def _analyze_one_video(video_path: str, previews_dir: str) -> dict:
                 'premium_score': scores.premium_score,
                 'travel_score': scores.travel_score,
                 'thumbnail_path': thumb_path or None,
+                'phash': phash,
             })
         except Exception as e:
-            import logging
-            logging.getLogger(__name__).warning(
-                f'[Pipeline] Scene {i} failed in {video_path}: {e}'
-            )
+            _log.warning(f'[Pipeline] Scene {i} failed in {video_path}: {e}')
             continue
+
+    # Deduplication pass
+    if dedup is not None and len(fragments) > 1:
+        fragments, pairs = dedup.filter_fragments(fragments)
+        if pairs:
+            _log.info(f'[Pipeline] {video_path}: {len(pairs)} duplicate pairs found')
+
+    # Remove internal phash field before returning (not stored in DB)
+    for f in fragments:
+        f.pop('phash', None)
 
     return {
         'fragments': fragments,
