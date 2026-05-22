@@ -41,14 +41,12 @@ class SceneDetector:
         from scenedetect.detectors import ContentDetector
 
         video = open_video(video_path)
-        fps = video.frame_rate or 30.0
-        min_len_frames = max(1, int(self.min_scene_length * fps))
 
         manager = SceneManager()
         manager.add_detector(
             ContentDetector(
                 threshold=self.threshold,
-                min_scene_len=min_len_frames,
+                min_scene_len=self.min_scene_length,  # 0.7+ accepts float seconds
             )
         )
         manager.detect_scenes(video, frame_skip=self.frame_skip)

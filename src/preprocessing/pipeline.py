@@ -92,8 +92,18 @@ def analyze_project(
             if progress_callback:
                 progress_callback(video_path.name, completed, len(pending))
 
-    good = db.count_fragments(min_quality=0.55)
     total = db.count_fragments(min_quality=0.0)
+    good = db.count_fragments(min_quality=0.55)
+
+    # Adaptive threshold: if very few good fragments, lower the bar
+    if good < 15 and total > 0:
+        relaxed = db.count_fragments(min_quality=0.35)
+        if relaxed > good:
+            logger.warning(
+                f'[Pipeline] Only {good} fragments at q>=0.55, '
+                f'{relaxed} available at q>=0.35 (adaptive mode)'
+            )
+
     logger.info(f'[Pipeline] Done. {good} good / {total} total fragments.')
     return good
 

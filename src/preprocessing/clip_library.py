@@ -78,20 +78,37 @@ class FragmentLibrary:
         }
         sort_by = style_score_key if style_score_key in allowed_sorts else 'quality_score'
 
-        rows = self.db.get_fragments_filtered(
-            source_ids=source_ids,
-            min_quality=min_quality,
-            min_duration=min_duration,
-            max_duration=max_duration,
-            approved_only=False,
-            exclude_duplicates=True,
-            sort_by=sort_by,
-            limit=limit,
-        )
+        def _fetch(q_threshold: float):
+            return self.db.get_fragments_filtered(
+                source_ids=source_ids,
+                min_quality=q_threshold,
+                min_duration=min_duration,
+                max_duration=max_duration,
+                approved_only=False,
+                exclude_duplicates=True,
+                sort_by=sort_by,
+                limit=limit,
+            )
+
+        rows = _fetch(min_quality)
+
+        # Adaptive threshold: relax if too few results
+        if len(rows) < 15:
+            for relaxed_q in [min_quality * 0.7, min_quality * 0.5, 0.0]:
+                relaxed_rows = _fetch(relaxed_q)
+                if len(relaxed_rows) >= 15 or relaxed_q == 0.0:
+                    if len(relaxed_rows) > len(rows):
+                        logger.warning(
+                            f'[FragmentLibrary] Adaptive: only {len(rows)} fragments '
+                            f'at q>={min_quality:.2f}, using {len(relaxed_rows)} '
+                            f'at q>={relaxed_q:.2f}'
+                        )
+                        rows = relaxed_rows
+                    break
 
         # Filter out manually disabled
         if approved_only:
-            rows = [r for r in rows if r['user_approved'] != 0]
+            rows = [r for r in rows if r['user_approved'] == 1]
         else:
             rows = [r for r in rows if r['user_approved'] != 0 or r['user_approved'] is None]
 

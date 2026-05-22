@@ -4031,6 +4031,29 @@ def show_render_panel():
         st.error("❌ Устраните проблемы выше")
         return
 
+    # Quality lint check (non-blocking warning)
+    _preset_id = st.session_state.get('selected_preset_id', '')
+    if _preset_id and st.session_state.get('selected_videos'):
+        try:
+            from src.storage.analysis_db import AnalysisDB as _ADB
+            from src.preprocessing.clip_library import FragmentLibrary as _FL
+            from src.preprocessing.quality_lint import check_style_compatibility, format_lint_warnings
+            _vdir = str(Path(st.session_state.selected_videos[0]).parent)
+            _pdb = _ADB(_vdir)
+            if _pdb.get_stats()['analyzed_files'] > 0:
+                _lib = _FL(_pdb)
+                _frags = _lib.get_fragments_for_ui(min_quality=0.0, limit=200)
+                _lint_warns = check_style_compatibility(_preset_id, _frags)
+                if _lint_warns:
+                    with st.expander(f'⚠️ Предупреждения качества материала ({len(_lint_warns)})', expanded=False):
+                        for _w in _lint_warns:
+                            if _w.severity == 'warning':
+                                st.warning(f'**{_w.message}**\n\n→ {_w.suggestion}')
+                            else:
+                                st.info(f'{_w.message}\n\n→ {_w.suggestion}')
+        except Exception:
+            pass
+
     # Big prominent button
     st.success("✅ Готово к сборке")
 
