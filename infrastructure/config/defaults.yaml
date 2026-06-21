@@ -1,0 +1,162 @@
+version: "1.0"
+
+quality:
+  # UMS score thresholds
+  good_threshold: 0.55
+  backup_threshold: 0.35
+  adaptive_min_good_count: 15
+
+  # Frame-level rejection
+  sharpness_min: 0.04          # Laplacian variance (normalized)
+  stability_min: 0.05          # Optical flow jitter threshold
+  brightness_min: 0.05         # Normalized mean brightness
+  brightness_max: 0.95
+  edge_density_min: 0.008
+
+  # UMS weights
+  weights:
+    sharpness: 0.35
+    stability: 0.25
+    brightness: 0.20
+    contrast: 0.20
+    motion: 0.40
+    action: 0.30
+    complexity: 0.30
+    saliency: 0.50
+    rule_of_thirds: 0.50
+
+scene:
+  min_duration: 1.5            # seconds — primary pass
+  max_duration: 30.0           # seconds
+  merge_gap: 0.5               # seconds — adjacent scene merge gap
+  fallback_min_duration: 0.8   # seconds — fallback pass when too few scenes
+
+duplicate:
+  phash_threshold: 5           # Hamming distance (0–64)
+
+coverage:
+  comfortable_ratio: 1.5       # target_duration * ratio = comfortable pool
+  min_ratio: 1.0
+
+timeline:
+  default_duration: 30.0       # seconds
+  duration_tolerance: 0.10     # ±10%
+  max_intro_count: 2
+  max_outro_count: 2
+  intro_max_duration: 3.0
+  outro_max_duration: 3.0
+
+music_sync:
+  beat_snap_tolerance: 0.10    # seconds — snap cut to nearest beat within this window
+  clip_duration:
+    low_energy:   [4.0, 7.0]
+    mid_energy:   [2.0, 4.0]
+    high_energy:  [0.8, 2.5]
+  default_min_clip: 1.0
+  default_max_clip: 4.0
+
+render:
+  fps: 30
+  pixel_format: "yuv420p"
+  default_preset: "fast"
+  score_boost: 0.30            # priority fragment score boost
+
+platforms:
+  reels:
+    format: "9_16"
+    duration: 30
+  tiktok:
+    format: "9_16"
+    duration: 30
+  shorts:
+    format: "9_16"
+    duration: 60
+  youtube:
+    format: "16_9"
+    duration: 60
+  stories:
+    format: "9_16"
+    duration: 15
+  website_hero:
+    format: "16_9"
+    duration: 10
+
+storage:
+  project_dir_name: ".videoeditor"
+  analysis_db_name: "analysis.db"
+  manifest_name: "project.json"
+  previews_dir: "previews"
+  audio_clips_dir: "audio_clips"
+  manual_segments_file: "manual_segments.json"
+  temp_dir: "temp"
+
+database:
+  schema_version: 3
+
+video_intelligence:
+  enabled: true
+
+  camera_motion:
+    model: "optical_flow"           # optical_flow | gyroscope | deep
+    min_confidence: 0.55
+    speed_thresholds:
+      slow: 2.0                     # px/frame average flow magnitude
+      fast: 8.0
+
+  semantic_tagger:
+    backend: "rule_based"           # rule_based | clip
+    clip_model: "ViT-B/32"
+    min_tag_confidence: 0.60
+    max_tags_per_segment: 5
+    tag_taxonomy:
+      - drone
+      - aerial
+      - nature
+      - landscape
+      - sunset
+      - sunrise
+      - crowd
+      - people
+      - sport
+      - action
+      - urban
+      - architecture
+      - water
+      - mountain
+      - forest
+      - beach
+      - indoor
+      - studio
+      - face_closeup
+      - product
+
+  people_intelligence:
+    enabled: true
+    eye_state_min_face_size: 0.04   # min face_size_ratio to detect eye state
+    pose_detector: "mediapipe"      # mediapipe | none
+    body_crop_margin: 0.15          # fraction of frame around detected body
+
+  style_fit:
+    score_weights:
+      motion: 0.30
+      semantic: 0.35
+      role: 0.20
+      quality: 0.15
+    recompute_on_style_change: true
+
+  concept_detection:
+    enabled: true
+    min_clips_for_concept: 5        # need at least N clips to infer concept
+    narrative_arc_rules:
+      wedding: three_act
+      travel: journey
+      sport: highlight_reel
+      event: highlight_reel
+      product: montage
+  engine: "sqlite"
+
+analysis:
+  parallel_workers: 4
+  enable_content_analysis: true    # MediaPipe face/person (Level 2)
+  enable_clip_tagging: false       # CLIP semantic tags (Level 4, needs torch)
+  enable_aesthetic_scoring: true

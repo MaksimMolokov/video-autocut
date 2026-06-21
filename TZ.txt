@@ -1,0 +1,357 @@
+Да, моя ошибка. Результат ниже.
+
+## 1. Краткое резюме продукта
+
+Это сервис, который из сырых видео и музыки автоматически собирает готовый ролик: выбирает лучшие фрагменты, удаляет брак, синхронизирует монтаж с битами музыки, применяет стиль, формат, длительность и дает пользователю возможность вручную поправить выбор перед финальным рендером.
+
+Текущий проект уже не с нуля: есть Streamlit, FFmpeg, OpenCV, PySceneDetect, librosa, MediaPipe, SQLite, пресеты, ручная разметка, анализ качества, дедупликация, музыкальная синхронизация и A/B/C/D варианты.
+
+Важно: файл, который реально загружен в окружение, относится к MVP дрона для отбора CO2, а не к Auto Video Editor. Поэтому ниже я опираюсь на текстовое описание проекта из сообщения. 
+
+## 2. Главная проблема текущей версии
+
+Сейчас это рабочий локальный прототип, но не масштабируемый продукт.
+
+Главные ограничения:
+
+1. `gui.py` на 4500 строк смешивает UI, бизнес-логику и пайплайн.
+2. SQLite без миграций опасен для развития.
+3. Абсолютные пути ломают переносимость проектов.
+4. Пресеты есть, но веса и логика частично зашиты в код.
+5. Рейтинг рендера собирается, но не влияет на алгоритмы.
+6. Автоматический монтаж работает, но качество выбора кадров пока основано на эвристиках, а не на обучении на данных.
+
+## 3. Целевая концепция
+
+Продукт должен стать не просто “рендерилкой”, а системой планирования монтажа.
+
+Правильная логика:
+
+1. Сначала анализ материала.
+2. Потом создание библиотеки фрагментов.
+3. Потом пользовательский контроль.
+4. Потом выбор стиля.
+5. Потом выбор формата.
+6. Потом выбор длительности.
+7. Потом генерация timeline.
+8. Потом preview.
+9. Потом финальный render.
+
+Стиль не должен включать формат и длительность. Стиль отвечает за монтажную эстетику. Формат отвечает за aspect ratio, resolution, crop. Длительность отвечает за плотность отбора.
+
+## 4. Рекомендуемая архитектура
+
+### MVP локальный
+
+* UI: Streamlit или Gradio
+* Backend core: Python
+* Video processing: FFmpeg, OpenCV
+* Scene detection: PySceneDetect
+* Audio: librosa, Essentia
+* CV: MediaPipe, YOLO, CLIP optional
+* Storage: SQLite
+* Config: YAML presets
+* Render: FFmpeg CLI через безопасный subprocess list args
+* Jobs: локальная очередь задач
+
+### Коммерческая версия
+
+* Frontend: Next.js
+* Backend API: FastAPI
+* Queue: Celery или RQ
+* Broker: Redis
+* DB: PostgreSQL
+* Storage: S3-compatible
+* Workers: CPU workers и GPU workers
+* Render service: FFmpeg workers
+* ML service: отдельный сервис анализа
+* Auth: Clerk, Auth0 или собственная JWT схема
+* Billing: Stripe
+* Deployment: Docker Compose для MVP, Kubernetes позже
+
+## 5. Pipeline обработки видео
+
+| Этап                | Что делает                           | MVP               |
+| ------------------- | ------------------------------------ | ----------------- |
+| Upload              | принимает видео и аудио              | да                |
+| Validation          | проверяет формат, размер, fps, codec | да                |
+| Proxy generation    | делает легкие preview-файлы          | да                |
+| Scene detection     | режет видео на сцены                 | да                |
+| Shot detection      | ищет монтажные границы               | да                |
+| Quality analysis    | резкость, яркость, контраст, тряска  | да                |
+| Content detection   | лица, люди, объекты                  | частично          |
+| Duplicate detection | pHash, embeddings                    | да, pHash         |
+| Aesthetic scoring   | красота кадра                        | простая эвристика |
+| Music analysis      | BPM, beat, energy, sections          | да                |
+| Clip selection      | выбирает кандидатов                  | да                |
+| Timeline generation | строит монтаж                        | да                |
+| Smart crop          | вертикальный/горизонтальный crop     | MVP упрощенно     |
+| Preview render      | быстрый рендер 480p/720p             | да                |
+| Manual correction   | pin, exclude, reorder, trim          | да                |
+| Final render        | экспорт MP4                          | да                |
+
+## 6. Что взять в MVP 1
+
+Не надо сразу делать “идеальный AI-монтажер”.
+
+В MVP 1 должно быть:
+
+1. Загрузка нескольких видео.
+2. Загрузка музыки.
+3. Автоанализ видео.
+4. Список найденных сцен.
+5. Оценка качества сцены.
+6. Причина выбора или отклонения.
+7. Pin / Exclude / Required / Forbidden.
+8. Выбор стиля.
+9. Выбор формата отдельно.
+10. Выбор длительности отдельно.
+11. Beat-sync по музыке.
+12. Preview render.
+13. Финальный render.
+14. История проектов.
+15. 5-6 реально отличающихся стилей, не 20.
+
+## 7. Первые стили, которые стоит оставить
+
+| Стиль                   | Для чего                 | Динамика             |
+| ----------------------- | ------------------------ | -------------------- |
+| Cinematic Nature        | природа, drone, travel   | медленная            |
+| Dynamic Travel          | поездки, прогулки, город | средняя              |
+| Drone Smooth            | дрон, плавные пролеты    | медленная            |
+| Fast Reels              | Reels, TikTok, Shorts    | быстрая              |
+| Family Memories         | семья, дети, события     | мягкая               |
+| Event Highlights        | мероприятия              | средне-быстрая       |
+| Sport Energy            | спорт, движение          | быстрая              |
+| Luxury Promo            | кафе, отели, бизнес      | плавная, премиальная |
+| Real Estate Walkthrough | недвижимость             | спокойная            |
+| Social Viral Cut        | короткие соцсети         | агрессивная          |
+
+На MVP лучше оставить 6: Cinematic Nature, Dynamic Travel, Drone Smooth, Fast Reels, Family Memories, Luxury Promo.
+
+## 8. Форматы отдельно от стилей
+
+| Формат             | Aspect ratio | Типичная длительность |
+| ------------------ | -----------: | --------------------: |
+| YouTube Shorts     |         9:16 |             15-60 сек |
+| Instagram Reels    |         9:16 |             15-90 сек |
+| TikTok             |         9:16 |             10-60 сек |
+| YouTube Horizontal |         16:9 |              1-10 мин |
+| Full HD Horizontal |         16:9 |                 любая |
+| 4K Horizontal      |         16:9 |                 любая |
+| Square             |          1:1 |             15-60 сек |
+| Wide Cinematic     |         21:9 |       30 сек и больше |
+| Custom             |        любой |                 любая |
+
+Для vertical crop нужно использовать face/person/object tracking. Если людей нет, брать saliency + motion center. Если crop плохой, показывать пользователю предупреждение.
+
+## 9. Алгоритмы для MVP
+
+Обязательно:
+
+* PySceneDetect для сцен.
+* OpenCV sharpness через Laplacian variance.
+* Brightness/contrast через histogram metrics.
+* Shake detection через optical flow или feature tracking.
+* pHash для дублей.
+* MediaPipe Face/Person для людей.
+* librosa для BPM, onset, beats, RMS energy.
+* FFmpeg для render, normalize, crop, scale.
+* YAML presets для стилей.
+
+Позже:
+
+* CLIP embeddings.
+* Video embeddings.
+* Aesthetic model.
+* YOLO object detection.
+* Smart reframing на базе tracking.
+* Learning from user ratings.
+* Reference-based editing “сделай как в примере”.
+
+## 10. Конкуренты
+
+Рынок уже есть, но ниша остается.
+
+* GoPro Quik автоматически выбирает лучшие моменты, синхронизирует с музыкой и добавляет переходы. Это близкий конкурент для action/drone/travel. ([Google Play][1])
+* OnBeat делает beat-sync для Reels и travel recap, но больше похож на mobile app с шаблонами. ([App Store][2])
+* VEED и Kapwing больше ориентированы на talking video, podcast, social clips и transcript-based editing. ([VEED][3])
+* Magisto позиционируется как fully automated AI engine для готовых video stories. ([Vimeo][4])
+* Adobe уже двигается в сторону AI first draft editing, где AI собирает черновой монтаж из клипов, но оставляет контроль пользователю. ([The Verge][5])
+* Apple/Final Cut Pro также идет к AI Montage Maker, beat detection, visual search и auto crop. ([Digital Camera World][6])
+
+Ниша продукта: не “еще один AI video editor”, а специализированный auto-montage engine для travel, drone, family, event, cafe promo, nature и lifestyle видео, где пользователь загружает много сырого материала и хочет получить красивый ролик без ручной нарезки.
+
+## 11. Модель данных
+
+Минимально нужны сущности:
+
+* User
+* Project
+* SourceVideo
+* SourceAudio
+* Scene
+* Shot
+* ClipCandidate
+* QualityMetrics
+* AudioBeatMap
+* MusicSection
+* StylePreset
+* OutputFormat
+* Timeline
+* TimelineSegment
+* Transition
+* ManualSelection
+* RenderJob
+* ExportFile
+* RenderFeedback
+
+Критично добавить:
+
+* относительные пути вместо абсолютных
+* schema_version
+* project_version
+* preset_version
+* render_config_snapshot
+* analysis_config_snapshot
+
+## 12. Roadmap
+
+### Этап 1. Рефакторинг ядра
+
+Результат: отделить UI от core.
+
+Задачи:
+
+* вынести wizard state
+* вынести project service
+* вынести render service
+* вынести analysis service
+* убрать бизнес-логику из `gui.py`
+
+### Этап 2. Надежный project storage
+
+Результат: проекты можно переносить.
+
+Задачи:
+
+* относительные пути
+* миграции SQLite
+* project manifest
+* schema versioning
+* единый project directory layout
+
+### Этап 3. Улучшение анализа
+
+Результат: лучшее качество отбора.
+
+Задачи:
+
+* объяснимые reasons
+* scoring weights в YAML
+* separate technical score, content score, style score
+* better duplicate detection
+* warning “материала недостаточно”
+
+### Этап 4. UX ручного отбора
+
+Результат: пользователь понимает, что выбрал AI.
+
+Задачи:
+
+* карточки сцен
+* reasons
+* quality badges
+* pin/exclude
+* required/forbidden
+* trim
+* reorder
+* rebuild preview автоматически
+
+### Этап 5. Web/cloud версия
+
+Результат: продукт можно запускать как SaaS.
+
+Задачи:
+
+* FastAPI
+* PostgreSQL
+* S3
+* Redis queue
+* workers
+* job statuses
+* preview streaming
+
+## 13. Главные риски
+
+| Риск                             | Как снижать                                                  |
+| -------------------------------- | ------------------------------------------------------------ |
+| Дорогая обработка видео          | proxy, sampling, cache, async jobs                           |
+| Медленный render                 | preview в 480p, final отдельно                               |
+| Плохой выбор кадров              | ручной контроль, explainable scoring                         |
+| Плохой smart crop                | face/person tracking, crop preview                           |
+| Сложность beat-sync              | начинать с beats + energy, не с полной музыкальной структуры |
+| Субъективность красоты           | рейтинги пользователя, A/B варианты                          |
+| 10-15 стилей сложно поддерживать | сначала 6 качественных                                       |
+| Музыка и права                   | библиотека royalty-free, предупреждения                      |
+| Большие файлы                    | upload limits, chunk upload, proxy                           |
+| Разные кодеки                    | normalize через FFmpeg                                       |
+
+## 14. Команда
+
+Минимально:
+
+* 1 strong Python/video engineer
+* 1 fullstack developer
+* 1 UX/UI designer part-time
+* 1 ML/CV engineer part-time
+
+На раннем MVP один сильный fullstack/Python developer может сделать многое, если не лезть глубоко в ML.
+
+Очень сложные блоки:
+
+* smart crop
+* хороший aesthetic scoring
+* стабильный cloud render
+* обучение на пользовательских рейтингах
+* качественная музыкальная структура intro/drop/chorus
+
+## 15. С чего начать прямо сейчас
+
+1. Разобрать `gui.py` на слои.
+2. Ввести нормальную модель Project.
+3. Добавить миграции БД.
+4. Перевести пути на относительные.
+5. Вынести веса scoring в YAML.
+6. Сделать экран найденных сцен нормальным продуктовым экраном.
+7. Оставить 6 стилей и довести их до качества.
+8. Сделать preview render быстрым и обязательным.
+9. Добавить explainability: почему фрагмент выбран.
+10. Добавить warning до рендера, если материала не хватает.
+
+## 16. Итоговая таблица приоритетов
+
+| Приоритет | Задача                                     |
+| --------- | ------------------------------------------ |
+| P0        | Разделить стиль, формат и длительность     |
+| P0        | Рефакторинг `gui.py`                       |
+| P0        | Миграции БД                                |
+| P0        | Относительные пути                         |
+| P0        | Preview render                             |
+| P1        | Улучшить экран ручного отбора              |
+| P1        | Explainable scoring                        |
+| P1        | 6 нормальных стилей                        |
+| P1        | Beat-sync stable                           |
+| P2        | Smart crop                                 |
+| P2        | CLIP/video embeddings                      |
+| P2        | Learning from ratings                      |
+| P3        | Cloud/SaaS                                 |
+| P3        | Reference-based editing                    |
+| P3        | Автообложки, captions, интеграции соцсетей |
+
+[1]: https://play.google.com/store/apps/details?hl=en&id=com.gopro.smarty&utm_source=chatgpt.com "GoPro Quik: Video Editor - Apps on Google Play"
+[2]: https://apps.apple.com/be/app/onbeat-reels-video-maker/id1635685232?utm_source=chatgpt.com "OnBeat: Reels Video Maker - App Store - Apple"
+[3]: https://www.veed.io/tools/auto-video-editor?utm_source=chatgpt.com "Auto Video Editor - Automatic Video Editing & Noise Removal"
+[4]: https://www.magisto.com/account/upgrade?utm_source=chatgpt.com "Online Video Editor by Magisto | Plans and Pricing"
+[5]: https://www.theverge.com/tech/884285/adobe-firefly-ai-video-editing-quick-cut?utm_source=chatgpt.com "Adobe's new AI video editing tool stitches clips into a first draft"
+[6]: https://www.digitalcameraworld.com/photography/video-editing/final-cut-pro-will-soon-search-with-ai-detect-beats-and-automate-a-montage-on-the-heels-of-the-apple-creator-studio-announcement?utm_source=chatgpt.com "Final Cut Pro will soon search with AI, detect beats and automate a montage on the heels of the Apple Creator Studio announcement"

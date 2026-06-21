@@ -1,0 +1,60 @@
+preset_id: cinematic_nature
+name: Cinematic Nature
+emoji: "🌿"
+description: Медленные, плавные кадры природы, дрона и путешествий. Кинематографичная эстетика.
+recommended_for: [природа, дрон, travel, пейзаж, wildlife]
+dynamic_level: slow
+
+clip_selection:
+  segment_min_duration: 3.0
+  segment_max_duration: 8.0
+  prefer_wide_shots: true
+  prefer_stable: true
+  prefer_natural_colors: true
+  min_quality_score: 0.50
+
+transitions:
+  type: crossfade
+  duration: 0.8
+  randomize: false
+
+speed_effects:
+  enabled: false
+
+color:
+  style: cinematic
+  saturation_boost: 0.05
+  contrast_boost: 0.10
+  warmth: 0.05
+
+music_sync:
+  mode: dynamic_sync        # cuts follow energy curve, not every beat
+  prefer_calm_sections: true
+  cut_on_beat: false
+
+scoring_weights:
+  sharpness: 1.0
+  stability: 1.2
+  brightness: 0.8
+  colorfulness: 0.9
+  motion: 0.4              # slow motion preferred
+  face_presence: 0.3
+  aesthetic_score: 1.2
+  wide_shot_bonus: 0.8
+
+segment_selection:
+  preferred_scene_categories: [landscape, nature, aerial, outdoor, water, forest, mountain]
+  preferred_camera_motion: [static, dolly, pan_left, pan_right, tilt_up, aerial_forward]
+  rejected_camera_motion: [shake, handheld, landing, takeoff, chaotic]
+  min_scores:
+    quality_score: 0.50
+    horizon_level_score: 0.55
+    composition_score: 0.45
+  role_rules:
+    intro:
+      preferred_tags: [aerial, landscape, sunrise, sunset, wide_shot]
+      duration_sec: {min: 3, max: 8}
+    main_part:
+      preferred_tags: [nature, landscape, water, forest]
+    ending:
+      preferred_tags: [sunset, aerial, landscape, wide_shot]

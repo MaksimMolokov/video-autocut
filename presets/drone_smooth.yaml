@@ -1,0 +1,60 @@
+preset_id: drone_smooth
+name: Drone Smooth
+emoji: "🚁"
+description: Плавные дроновые пролёты. Длинные сцены, минимум резких резок.
+recommended_for: [дрон, aerial, пролёт, drone, sky, landscape]
+dynamic_level: slow
+
+clip_selection:
+  segment_min_duration: 4.0
+  segment_max_duration: 12.0
+  prefer_wide_shots: true
+  prefer_stable: true
+  prefer_slow_motion: false
+  min_quality_score: 0.45
+
+transitions:
+  type: crossfade
+  duration: 1.2
+  randomize: false
+
+speed_effects:
+  enabled: false
+
+color:
+  style: cinematic
+  saturation_boost: 0.08
+  contrast_boost: 0.12
+  vignette: 0.15
+
+music_sync:
+  mode: dynamic_sync
+  cut_on_beat: false
+  prefer_calm_sections: true
+
+scoring_weights:
+  sharpness: 0.9
+  stability: 1.5          # extra weight on stability for drone footage
+  brightness: 0.9
+  colorfulness: 1.0
+  motion: 0.3             # smooth motion preferred, not frantic
+  camera_motion_pan_bonus: 0.8
+  aesthetic_score: 1.3
+  wide_shot_bonus: 1.2
+
+segment_selection:
+  preferred_scene_categories: [aerial, drone, landscape, nature, water, mountain, sky]
+  preferred_camera_motion: [aerial_forward, aerial_descent, pan_left, pan_right, tilt_up, dolly]
+  rejected_camera_motion: [shake, handheld, landing, takeoff, chaotic]
+  min_scores:
+    quality_score: 0.45
+    stability: 0.60
+    horizon_level_score: 0.50
+  role_rules:
+    intro:
+      preferred_tags: [aerial, landscape, wide_shot, establishing_shot]
+      duration_sec: {min: 4, max: 10}
+    main_part:
+      preferred_tags: [aerial, drone, nature, landscape]
+    ending:
+      preferred_tags: [sunset, aerial, wide_shot]

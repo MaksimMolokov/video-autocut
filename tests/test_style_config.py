@@ -45,8 +45,8 @@ class TestAllStyleIDsExist(unittest.TestCase):
         self.profiles = _load_style_profiles()
 
     def test_exactly_14_profiles(self):
-        self.assertEqual(len(self.profiles), 14,
-                         f"Expected 14 styles, got {len(self.profiles)}: {list(self.profiles)}")
+        self.assertEqual(len(self.profiles), len(ALL_14_STYLE_IDS),
+                         f"Expected {len(ALL_14_STYLE_IDS)} styles, got {len(self.profiles)}: {list(self.profiles)}")
 
     def test_no_duplicate_ids(self):
         ids = list(self.profiles.keys())
@@ -82,7 +82,7 @@ class TestAllStyleIDsExist(unittest.TestCase):
 
     def test_use_new_system_list_covers_13_presets(self):
         """
-        The use_new_system list in gui.py must cover exactly the 13 non-easy styles.
+        The use_new_system list in gui.py must cover exactly the non-easy styles.
         easy_mode uses EasyClipSelector, not TimelineBuilder.
         """
         use_new = [
@@ -91,6 +91,7 @@ class TestAllStyleIDsExist(unittest.TestCase):
             'travel_story', 'real_estate_property_tour', 'event_highlights',
             'calm_minimal_documentary', 'intelligent_beauty_mix',
             'sport_dynamic_cut', 'sport_highlight_impact',
+            'f1', 'f2', 'f3', 'f4', 'f5', 'f6',
         ]
         expected = sorted(TIMELINE_STYLE_IDS)
         self.assertEqual(sorted(use_new), expected)

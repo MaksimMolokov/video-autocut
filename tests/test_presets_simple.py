@@ -36,18 +36,22 @@ class TestPresetLoading(unittest.TestCase):
         self.assertTrue(self.presets_dir.is_dir(), f"Presets path is not a directory")
 
     def test_02_all_10_presets_exist(self):
-        """Test that all 10 presets exist"""
+        """Test that all core presets exist"""
         expected_presets = [
-            "clean_basic",
-            "cinematic_nature_drone",
-            "urban_drone_promo",
+            "easy_mode",
+            "drone_nature_cinematic",
+            "drone_landscape_clean",
             "fast_action_sport",
-            "fpv_fast_cut",
-            "social_reels_dynamic",
+            "urban_city_rhythm",
+            "social_media_punchy",
             "business_promo_clean",
-            "real_estate_object_showcase",
-            "travel_memories",
-            "construction_inspection_report"
+            "real_estate_property_tour",
+            "travel_story",
+            "event_highlights",
+            "calm_minimal_documentary",
+            "intelligent_beauty_mix",
+            "sport_dynamic_cut",
+            "sport_highlight_impact",
         ]
 
         for preset_id in expected_presets:
@@ -161,6 +165,9 @@ class TestPresetValidation(unittest.TestCase):
 
         for preset_id, preset in presets.items():
             speed = preset.settings.speed_effects
+            if not speed.enabled:
+                # Выключенные speed-эффекты держат нейтральный factor 1.0 — это валидно
+                continue
 
             # Slow motion factor should be < 1.0
             self.assertGreaterEqual(speed.slow_motion_factor, 0.3,
@@ -222,7 +229,7 @@ class TestPresetRegistry(unittest.TestCase):
 
     def test_11_registry_get_preset_by_id(self):
         """Test getting individual presets by ID"""
-        test_ids = ["clean_basic", "cinematic_nature_drone", "social_reels_dynamic"]
+        test_ids = ["easy_mode", "drone_nature_cinematic", "social_media_punchy"]
 
         for preset_id in test_ids:
             preset = self.registry.get_preset(preset_id)

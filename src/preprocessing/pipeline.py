@@ -8,7 +8,8 @@ from typing import Callable, List, Optional
 
 logger = logging.getLogger(__name__)
 
-VIDEO_EXTENSIONS = {'.mp4', '.mov', '.avi', '.mkv', '.m4v', '.wmv', '.flv', '.webm'}
+VIDEO_EXTENSIONS = {'.mp4', '.mov', '.avi', '.mkv', '.m4v', '.wmv', '.flv', '.webm',
+                    '.mts', '.m2ts', '.mxf', '.3gp', '.ts', '.vob', '.dv'}
 
 
 def list_video_files(project_dir: str) -> List[Path]:
@@ -26,6 +27,7 @@ def analyze_project(
     project_dir: str,
     progress_callback: Optional[Callable[[str, int, int], None]] = None,
     force_reanalyze: bool = False,
+    enable_clip_tagging: bool = False,
 ) -> int:
     """
     Analyze all video files in project_dir.
@@ -54,17 +56,24 @@ def analyze_project(
         logger.info(f'[Pipeline] All files cached. {n} total fragments.')
         return db.count_fragments(min_quality=0.55)
 
+    # CLIP tagging loads a 600 MB model per worker — use 1 worker when enabled
     cpu_count = max(1, (os.cpu_count() or 2) // 2)
+    if enable_clip_tagging:
+        cpu_count = 1
     logger.info(
         f'[Pipeline] Analyzing {len(pending)}/{len(videos)} files '
         f'using {cpu_count} workers'
+        + (' (CLIP tagging ON)' if enable_clip_tagging else '')
     )
 
     previews_dir = str(Path(project_dir) / '.videoeditor' / 'previews')
 
     with ProcessPoolExecutor(max_workers=cpu_count) as executor:
         futures = {
-            executor.submit(_analyze_one_video, str(v), previews_dir): v
+            executor.submit(
+                _analyze_one_video, str(v), previews_dir,
+                True, True, True, enable_clip_tagging,
+            ): v
             for v in pending
         }
         completed = 0
@@ -114,6 +123,7 @@ def _analyze_one_video(
     enable_content_analysis: bool = True,
     enable_dedup: bool = True,
     enable_video_preview: bool = True,
+    enable_clip_tagging: bool = False,
 ) -> dict:
     """
     Worker function — runs in a separate process.
@@ -137,11 +147,34 @@ def _analyze_one_video(
         except Exception as e:
             _log.warning(f'[Pipeline] ContentAnalyzer unavailable: {e}')
 
+    # CLIP tagger (Level 4, optional)
+    clip_tagger = None
+    if enable_clip_tagging:
+        try:
+            from src.preprocessing.clip_tagger import ClipTagger
+            clip_tagger = ClipTagger()
+        except Exception as e:
+            _log.warning(f'[Pipeline] ClipTagger unavailable: {e}')
+
     detector = SceneDetector()
     analyzer = QualityAnalyzer()
     scorer = ClipScorer()
     previewer = PreviewGenerator(previews_dir)
     dedup = DuplicateDetector() if enable_dedup else None
+
+    # Pre-flight check: verify OpenCV can open the file.
+    # If it can't, raise immediately so mark_error() is called instead of
+    # mark_analyzed() with 0 fragments (which would cache a broken state forever).
+    import cv2 as _cv2
+    _test_cap = _cv2.VideoCapture(video_path)
+    if not _test_cap.isOpened():
+        _test_cap.release()
+        raise RuntimeError(
+            f"OpenCV не может открыть видеофайл. "
+            f"Возможно, кодек не поддерживается. "
+            f"Попробуйте конвертировать в H.264 MP4."
+        )
+    _test_cap.release()
 
     duration_s, fps, resolution = _get_video_meta(video_path)
 
@@ -149,11 +182,28 @@ def _analyze_one_video(
     fragments = []
     frag_counter = abs(hash(video_path)) % 10_000_000
 
+    # Track quality-rejected scenes separately for diagnostics
+    quality_rejected_count = 0
+
     for i, scene in enumerate(scenes):
         try:
             metrics = analyzer.analyze(video_path, scene)
-            if metrics.is_rejected:
+
+            # Hard-skip only truly unreadable / corrupt frames.
+            # Quality-filtered frames (blurry, unstable, dark) are kept so that
+            # the UMS scorer can rank them — discarding them here caused "no fragments"
+            # errors on DJI/drone/action footage where motion blur is normal.
+            _unreadable = metrics.reject_reason in ('no_frames', 'black_frame', 'corrupt')
+            if _unreadable:
+                quality_rejected_count += 1
                 continue
+
+            if metrics.is_rejected:
+                quality_rejected_count += 1
+                _log.debug(
+                    f'[Pipeline] Scene {i} quality-filtered ({metrics.reject_reason})'
+                    f' — kept with reduced score'
+                )
 
             # Content analysis (Level 2)
             content = None
@@ -163,7 +213,17 @@ def _analyze_one_video(
                 except Exception as e:
                     _log.debug(f'[Pipeline] Content analysis scene {i}: {e}')
 
-            scores = scorer.score(metrics, content)
+            # Semantic tag (Level 4) — runs before scorer so it can influence scores
+            scene_tag = None
+            if clip_tagger is not None:
+                try:
+                    scene_tag = clip_tagger.tag_scene(
+                        video_path, scene.start_s, scene.end_s
+                    )
+                except Exception as e:
+                    _log.debug(f'[Pipeline] CLIP tag scene {i}: {e}')
+
+            scores = scorer.score(metrics, content, scene_tag=scene_tag)
 
             frag_id = frag_counter + i
             thumb_path = previewer.generate_thumbnail(
@@ -198,11 +258,18 @@ def _analyze_one_video(
                 'stability': metrics.stability,
                 'action': metrics.action,
                 'calm': metrics.calm,
+                'colorfulness': metrics.colorfulness,
+                'complexity': metrics.complexity,
+                'camera_motion_type': metrics.camera_motion_type,
+                'composition_score': metrics.composition_score,
+                'temporal_coherence': metrics.temporal_coherence,
+                'saliency_score': metrics.saliency_score,
                 # Content fields (None if content analyzer unavailable)
                 'has_face': int(content.has_face) if content else None,
                 'has_person': int(content.has_person) if content else None,
                 'has_subject': int(content.has_subject) if content else None,
                 'scene_type': content.scene_type if content else None,
+                'scene_tag': scene_tag,
                 'crop_9_16': content.crop_9_16 if content else None,
                 # Scores
                 'is_duplicate': False,
@@ -225,6 +292,26 @@ def _analyze_one_video(
         fragments, pairs = dedup.filter_fragments(fragments)
         if pairs:
             _log.info(f'[Pipeline] {video_path}: {len(pairs)} duplicate pairs found')
+
+    # Log quality-rejection summary
+    if quality_rejected_count > 0:
+        _log.info(
+            f'[Pipeline] {Path(video_path).name}: '
+            f'{quality_rejected_count}/{len(scenes)} scenes had quality issues '
+            f'(kept with reduced scores)'
+        )
+
+    # Only raise if frames literally could not be decoded (no fragments AND scenes exist
+    # AND every scene had an unreadable-frame error, not a quality filter).
+    # Previously this raised for ALL quality rejections, which caused mark_error() to
+    # silently block re-analysis of perfectly valid footage (DJI, action, drone).
+    if not fragments and scenes:
+        raise RuntimeError(
+            f"Видеофайл содержит {len(scenes)} обнаруженных сцен, "
+            f"но все кадры неудалось декодировать. "
+            f"Возможные причины: повреждённый файл, неподдерживаемый кодек "
+            f"(попробуйте конвертировать в H.264 MP4)."
+        )
 
     # Remove internal phash field before returning (not stored in DB)
     for f in fragments:

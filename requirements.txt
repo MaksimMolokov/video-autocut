@@ -1,14 +1,35 @@
-PyYAML>=6.0.1
+# ── Core UI ────────────────────────────────────────────────────────────────────
 streamlit>=1.28.0
-librosa>=0.10.0
+streamlit-sortables>=0.2.0   # drag-and-drop reorder of clips on the draft screen
+
+# ── Video processing ───────────────────────────────────────────────────────────
+opencv-python==4.8.1.78
 numpy>=1.24.0
 scipy>=1.10.0
-opencv-python==4.8.1.78
 
-# Preprocessing pipeline (MVP)
+# ── Audio analysis (TASK-040, 041, 042, 043) ───────────────────────────────────
+librosa>=0.10.0
+# Speech/silence VAD (ROADMAP Фаза 1, AU-1): Silero — опционально. Требует torch.
+# Без него analysis/audio/vad_detector.py падает на energy-VAD (librosa). Включить:
+# torch>=2.0.0   # затем Silero подтянется через torch.hub при первом анализе
+
+# ── Scene detection (TASK-020) ─────────────────────────────────────────────────
 scenedetect>=0.6.3
 
-# Level 2: content analysis + deduplication
+# ── Content analysis — Level 2 (TASK-030, 031, 032) ───────────────────────────
 mediapipe>=0.10.0
-imagehash>=4.3.1
 Pillow>=10.0.0
+
+# ── Duplicate detection (TASK-025) ────────────────────────────────────────────
+imagehash>=4.3.1
+
+# ── Configuration ──────────────────────────────────────────────────────────────
+PyYAML>=6.0.1
+
+# ── Database ORM + migrations (TASK-010, 011) ─────────────────────────────────
+sqlalchemy>=2.0.0
+alembic>=1.13.0
+
+# ── Level 4: CLIP semantic tagging (TASK-033, optional) ───────────────────────
+# open_clip_torch>=2.20.0
+# torch>=2.0.0

@@ -38,6 +38,8 @@ class FragmentData:
     scene_type: Optional[str] = None
     # Level 3
     preview_path: Optional[str] = None
+    # Level 4
+    scene_tag: Optional[str] = None
 
 
 class FragmentLibrary:
@@ -67,6 +69,7 @@ class FragmentLibrary:
         max_duration: float = 10.0,
         approved_only: bool = False,
         limit: int = 200,
+        allowed_fragment_ids: Optional[set] = None,
     ) -> List:
         """
         Return CandidateClip-compatible objects from the DB.
@@ -119,6 +122,10 @@ class FragmentLibrary:
         else:
             rows = [r for r in rows if r['user_approved'] != 0 or r['user_approved'] is None]
 
+        # Preprocessing whitelist filter
+        if allowed_fragment_ids is not None:
+            rows = [r for r in rows if r['id'] in allowed_fragment_ids]
+
         return [self._row_to_candidate(r, r['source_path']) for r in rows]
 
     def get_all_candidates_for_project(
@@ -128,6 +135,7 @@ class FragmentLibrary:
         min_duration: float = 1.0,
         max_duration: float = 10.0,
         limit: int = 400,
+        allowed_fragment_ids: Optional[set] = None,
     ) -> List:
         return self.get_candidates(
             source_path=None,
@@ -136,6 +144,7 @@ class FragmentLibrary:
             min_duration=min_duration,
             max_duration=max_duration,
             limit=limit,
+            allowed_fragment_ids=allowed_fragment_ids,
         )
 
     # ------------------------------------------------------------------
@@ -147,11 +156,13 @@ class FragmentLibrary:
         min_quality: float = 0.50,
         sort_by: str = 'quality_score',
         limit: int = 200,
+        scene_tags: Optional[List[str]] = None,
     ) -> List[FragmentData]:
         rows = self.db.get_fragments_filtered(
             min_quality=min_quality,
             sort_by=sort_by,
             limit=limit,
+            scene_tags=scene_tags if scene_tags else None,
         )
 
         # Get source paths
@@ -190,6 +201,7 @@ class FragmentLibrary:
                 has_subject=row['has_subject'],
                 scene_type=row['scene_type'],
                 preview_path=row['preview_path'],
+                scene_tag=row['scene_tag'] if 'scene_tag' in row.keys() else None,
             ))
         return result
 
@@ -244,6 +256,8 @@ class FragmentLibrary:
             is_must_use=bool(row['user_priority']),
             final_score=row['quality_score'] or 0.5,
         )
+        # Fragment ID for preprocessing filter (used in render_video)
+        candidate._fragment_id = row['id']  # type: ignore[attr-defined]
         # Attach scene_type for diversity logic in TimelineBuilder (Level 3)
         scene_type = row['scene_type']
         if scene_type:

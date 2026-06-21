@@ -6,6 +6,7 @@ Works with LOCAL files only - no file upload to memory
 
 import streamlit as st
 from pathlib import Path
+from typing import Optional
 import sys
 import os
 import json
@@ -91,6 +92,17 @@ st.markdown("""
     [data-testid="stAlert"] { padding: 0.3rem 0.7rem !important; }
     /* Compact multiselect */
     .stMultiSelect { margin-bottom: 0 !important; }
+    /* Step 2 markup: compact video player */
+    [data-testid="stVideo"] video {
+        max-height: 280px !important;
+        width: 100% !important;
+        object-fit: contain !important;
+        background-color: #000 !important;
+    }
+    [data-testid="stVideo"] {
+        max-height: 280px !important;
+        overflow: hidden !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -198,6 +210,32 @@ if 'generation_status' not in st.session_state:
     st.session_state.generation_status = None  # idle / starting / analyzing / rendering / completed / failed
 if 'show_custom_duration' not in st.session_state:
     st.session_state.show_custom_duration = False
+if 'style_filter_cat' not in st.session_state:
+    st.session_state.style_filter_cat = 'all'
+
+# ── Preprocessing stage ──────────────────────────────────────────────────────
+if 'prep_mode' not in st.session_state:
+    st.session_state.prep_mode = None          # None|'running'|'done'|'skipped'
+if 'prep_approved_ids' not in st.session_state:
+    st.session_state.prep_approved_ids = None  # Set[int] | None (None = use all)
+if 'prep_music_range' not in st.session_state:
+    st.session_state.prep_music_range = None   # (start_s, end_s) | None
+if 'prep_video_frags' not in st.session_state:
+    st.session_state.prep_video_frags = []     # List[dict] cached fragment data
+if 'prep_music_frags' not in st.session_state:
+    st.session_state.prep_music_frags = []     # List[dict] cached music fragments
+if 'prep_rejected_fids' not in st.session_state:
+    st.session_state.prep_rejected_fids = set()  # Set[int] explicitly rejected by user
+if 'prep_calibration' not in st.session_state:
+    st.session_state.prep_calibration = {}
+if 'prep_diagnostic' not in st.session_state:
+    st.session_state.prep_diagnostic = {}
+if 'wizard_step' not in st.session_state:
+    st.session_state.wizard_step = 1           # 1=Materials, 2=Preparation, 3=Settings
+if '_s2_display_mode' not in st.session_state:
+    st.session_state._s2_display_mode = 'manual'   # 'manual'|'auto' — default to manual markup
+if 'prep_manual_confirmed' not in st.session_state:
+    st.session_state.prep_manual_confirmed = False
 
 # Easy mode settings defaults
 if 'easy_min_clip' not in st.session_state:
@@ -419,18 +457,919 @@ def _play_completion_sound(event_key: str):
     )
 
 
+def _fmt_ts(secs: float) -> str:
+    """Format seconds as M:SS."""
+    m, s = divmod(int(secs), 60)
+    return f"{m}:{s:02d}"
+
+
+def _video_frag_status(q: float) -> str:
+    if q >= 0.75:
+        return "🏆 Лучший"
+    if q >= 0.55:
+        return "✅ Хороший"
+    if q >= 0.35:
+        return "⚠️ Сомнительный"
+    return "❌ Слабый"
+
+
+def _run_prep_analysis(project_dir: str, music_path: Optional[str], force: bool = False):
+    """
+    Run video + music analysis, merge fragments into coherent scenes,
+    extract audio preview clips for music, and cache everything in session_state.
+
+    Pipeline:
+      1. analyze_project() — existing per-frame analysis, writes to DB
+      2. fetch ALL raw fragments from DB (no quality filter)
+      3. score_fragments() — compute UMS + dynamic category calibration
+      4. merge_fragments_into_scenes() — group consecutive frags into 3–30s scenes
+      5. build_diagnostic_report() — log fragment counts per video
+      6. music analysis + audio clip extraction
+    """
+    from src.preprocessing.pipeline import analyze_project
+    from src.storage.analysis_db import AnalysisDB
+    from src.preprocessing.scene_merger import (
+        merge_fragments_into_scenes, deduplicate_scenes, compute_beat_sync_scores,
+    )
+    from src.preprocessing.fragment_scorer import (
+        score_fragments, build_diagnostic_report,
+    )
+    from src.preprocessing.audio_clipper import get_or_create_audio_clip
+
+    with st.status("Анализ видеофрагментов...", expanded=True) as _status:
+        analyze_project(project_dir, force_reanalyze=force)
+        _status.update(label="Видео проанализированы", state="complete")
+
+    db = AnalysisDB(project_dir)
+
+    # Surface per-file analysis status so the user sees errors
+    file_statuses = db.get_source_files_status()
+    error_files = [s for s in file_statuses if s['status'] == 'error']
+    ok_files    = [s for s in file_statuses if s['status'] == 'analyzed']
+    if error_files:
+        for ef in error_files:
+            fname = Path(ef['path']).name
+            msg   = ef.get('error_msg') or 'неизвестная ошибка'
+            st.warning(f"⚠️ {fname}: ошибка анализа — {msg[:200]}")
+    if ok_files:
+        total_dur = sum((s.get('duration_s') or 0) for s in ok_files)
+        st.caption(
+            f"✅ Проанализировано {len(ok_files)}/{len(file_statuses)} видео "
+            f"· общая длительность {total_dur/60:.1f} мин"
+        )
+
+    # Fetch ALL raw fine-grained fragments (no quality filter, no upper duration cap).
+    # max_duration=3600 ensures long single-take videos (drone flights, event coverage)
+    # are not silently dropped — the scene_merger handles splitting at 30 s internally.
+    raw_frags = db.get_fragments_filtered(
+        min_quality=0.0, min_duration=0.5, max_duration=3600.0, limit=20000
+    )
+    raw_frags = [dict(r) for r in raw_frags]  # sqlite3.Row → plain dict
+
+    # Diagnostic: if still empty, try without duplicate filter (catches data inconsistencies)
+    if not raw_frags:
+        raw_frags_all = db.get_fragments_filtered(
+            min_quality=0.0, min_duration=0.5, max_duration=3600.0,
+            limit=20000, exclude_duplicates=False
+        )
+        raw_frags_all = [dict(r) for r in raw_frags_all]
+        if raw_frags_all:
+            st.info(
+                f"ℹ️ Найдено {len(raw_frags_all)} фрагментов, но все помечены как дубликаты. "
+                "Используем их для монтажа."
+            )
+            raw_frags = raw_frags_all
+        elif not error_files:
+            st.error(
+                "❌ Фрагменты не найдены. Возможные причины:\n"
+                "- Видео не поддерживается (попробуйте .mp4 или .mov)\n"
+                "- Видео слишком короткое (< 0.5 с)\n"
+                "- Ошибка при анализе (нажмите 🔄 Пересчитать)\n"
+                "- Видеофайлы повреждены"
+            )
+
+    # Score fragments: compute UMS + dynamic thresholds per project distribution
+    with st.status("Оценка качества фрагментов...", expanded=False) as _ss:
+        calib, enriched_frags = score_fragments(raw_frags)
+        n_best   = sum(1 for f in enriched_frags if f.get('category') == 'best')
+        n_good   = sum(1 for f in enriched_frags if f.get('category') == 'good')
+        n_backup = sum(1 for f in enriched_frags if f.get('category') == 'backup')
+        _ss.update(
+            label=f"Оценено {len(enriched_frags)} фрагментов: "
+                  f"🏆{n_best} хороших / ✅{n_good} подходящих / 🔄{n_backup} запасных",
+            state="complete",
+        )
+
+    # Merge consecutive fragments into coherent scenes (1.5–30 s)
+    with st.status("Формирование сцен...", expanded=False) as _ms2:
+        scenes = merge_fragments_into_scenes(enriched_frags, calibration=calib)
+        # Algorithm 4: cross-video pHash deduplication
+        scenes = deduplicate_scenes(scenes)
+        # Inject stable 'id' into each scene using its first fragment's DB id.
+        # Merged scenes do not have an 'id' key (they have 'fragment_ids' list),
+        # but the prep fragment viewer (lines ~708–771) uses frag['id'] as the
+        # scene identifier for the approved-set logic.  Without this injection
+        # every scene display raises KeyError: 'id'.
+        for _sc in scenes:
+            if 'id' not in _sc:
+                _fids = _sc.get('fragment_ids') or []
+                _sc['id'] = _fids[0] if _fids else id(_sc)
+        n_src   = len({s['source_id'] for s in scenes})
+        n_sbest = sum(1 for s in scenes if s.get('category') == 'best')
+        n_sgood = sum(1 for s in scenes if s.get('category') == 'good')
+        n_sbkup = sum(1 for s in scenes if s.get('category') == 'backup')
+        n_sdup  = sum(1 for s in scenes if s.get('is_cross_duplicate'))
+        _ms2.update(
+            label=f"Найдено {len(scenes)} сцен в {n_src} видео "
+                  f"(🏆{n_sbest} / ✅{n_sgood} / 🔄{n_sbkup}"
+                  + (f" / ♻️{n_sdup} дублей" if n_sdup else "") + ")",
+            state="complete",
+        )
+
+    st.session_state.prep_video_frags = scenes
+    st.session_state.prep_calibration  = calib
+
+    # Diagnostic report (logged; stored in session for UI display)
+    _tgt = st.session_state.get('target_duration') or 60
+    diag = build_diagnostic_report(enriched_frags, calib, scenes, float(_tgt))
+    st.session_state.prep_diagnostic = diag
+
+    # Music analysis + audio clip extraction
+    st.session_state.prep_music_frags = []
+    if music_path and Path(music_path).exists():
+        from src.preprocessing.music_fragment_analyzer import analyze_music_for_preprocessing
+        with st.status("Анализ музыки...", expanded=True) as _ms3:
+            music_frags = analyze_music_for_preprocessing(music_path, db, force=force)
+            _ms3.update(label=f"Найдено {len(music_frags)} музыкальных участков", state="complete")
+
+        # Extract audio preview clips for each music fragment
+        with st.status("Создание аудио-превью...", expanded=False) as _ams:
+            for mf in music_frags:
+                mf['audio_clip_path'] = get_or_create_audio_clip(
+                    music_path, mf['start_s'], mf['end_s']
+                )
+            _ams.update(label="Аудио-превью готовы", state="complete")
+
+        st.session_state.prep_music_frags = music_frags
+
+        # Algorithm 5: beat-sync scoring — inject beat_sync_score into each scene
+        with st.status("Синхронизация с музыкой...", expanded=False) as _bss:
+            updated_scenes = compute_beat_sync_scores(
+                st.session_state.prep_video_frags, music_frags
+            )
+            st.session_state.prep_video_frags = updated_scenes
+            _bss.update(
+                label=f"Beat-sync scores добавлены для {len(updated_scenes)} сцен",
+                state="complete",
+            )
+
+
+def _get_video_duration_cached(path: str) -> float:
+    """Get video duration in seconds via cv2, cached in session_state."""
+    import streamlit as _st
+    cache_key = f'_vdur_{abs(hash(path))}'
+    cached = _st.session_state.get(cache_key)
+    if cached is not None:
+        return float(cached)
+    try:
+        import cv2 as _cv2
+        cap = _cv2.VideoCapture(str(path))
+        if cap.isOpened():
+            fps    = cap.get(_cv2.CAP_PROP_FPS) or 30.0
+            frames = cap.get(_cv2.CAP_PROP_FRAME_COUNT)
+            cap.release()
+            dur = frames / fps if fps > 0 else 0.0
+            _st.session_state[cache_key] = dur
+            return dur
+        cap.release()
+    except Exception:
+        pass
+    try:
+        import subprocess, json as _json
+        r = subprocess.run(
+            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+             '-of', 'json', str(path)],
+            capture_output=True, text=True, timeout=10,
+        )
+        dur = float(_json.loads(r.stdout).get('format', {}).get('duration', 0))
+        _st.session_state[cache_key] = dur
+        return dur
+    except Exception:
+        return 0.0
+
+
+def _show_video_markup_block(video_path: str, video_idx: int, store) -> None:
+    """Render manual markup block for one source video inside Step 2 manual mode."""
+    from src.preprocessing.manual_segments import (
+        TAGS, TAG_NAMES, TAG_NAME_TO_ID, INCLUDE_POLICIES, PRIORITIES,
+        ManualSegment,
+    )
+
+    filename = Path(video_path).name
+    dur      = _get_video_duration_cached(video_path)
+    n_segs   = len(store.get_for_source(video_path))
+    badge    = f" · {n_segs} фрагм." if n_segs else ""
+
+    with st.expander(f"**{filename}**  {_fmt_ts(dur)}{badge}", expanded=(video_idx == 0)):
+        # Video player — compact two-column layout
+        _vid_col, _info_col = st.columns([3, 2])
+        with _vid_col:
+            if Path(video_path).exists():
+                st.video(video_path)
+            else:
+                st.warning(f"Файл не найден: {video_path}")
+        with _info_col:
+            st.caption(f"`{video_path}`")
+            st.caption(f"Длительность: **{_fmt_ts(dur)}**")
+            if n_segs:
+                st.caption(f"Размечено фрагментов: **{n_segs}**")
+
+        # Position slider  (used as proxy for current playback position)
+        _pos_key = f'_manual_pos_{video_idx}'
+        if _pos_key not in st.session_state:
+            st.session_state[_pos_key] = 0.0
+        cur_pos = st.slider(
+            "Текущая позиция (с)",
+            min_value=0.0,
+            max_value=max(float(dur), 1.0),
+            value=float(st.session_state[_pos_key]),
+            step=0.5,
+            key=_pos_key,
+            format="%.1f с",
+        )
+
+        # Start / end inputs  (writable via session_state so Mark In/Out can set them)
+        _sk = f'_manual_start_{video_idx}'
+        _ek = f'_manual_end_{video_idx}'
+        if _sk not in st.session_state:
+            st.session_state[_sk] = 0.0
+        if _ek not in st.session_state:
+            st.session_state[_ek] = min(float(dur), 10.0)
+
+        st.write("**Выделить фрагмент:**")
+        ti1, ti2, ti3, ti4 = st.columns([3, 1, 3, 1])
+        with ti1:
+            start_t = st.number_input(
+                "Начало (с)",
+                min_value=0.0,
+                max_value=max(float(dur) - 0.1, 0.1),
+                value=float(st.session_state[_sk]),
+                step=0.5,
+                key=_sk,
+            )
+        with ti2:
+            if st.button("Mark In", key=f'_markin_{video_idx}', use_container_width=True):
+                st.session_state[_sk] = round(cur_pos, 2)
+                st.rerun()
+        with ti3:
+            end_t = st.number_input(
+                "Конец (с)",
+                min_value=0.1,
+                max_value=max(float(dur), 0.2),
+                value=float(st.session_state[_ek]),
+                step=0.5,
+                key=_ek,
+            )
+        with ti4:
+            if st.button("Mark Out", key=f'_markout_{video_idx}', use_container_width=True):
+                st.session_state[_ek] = round(cur_pos, 2)
+                st.rerun()
+
+        # Tags / priority / policy
+        _tag_options = [t[1] for t in TAGS if t[0] not in ('forbidden', 'bad')]
+        tags_sel = st.multiselect(
+            "Теги / роли (можно несколько)",
+            options=_tag_options,
+            key=f'_manual_tags_{video_idx}',
+        )
+        cp1, cp2, cp3 = st.columns([2, 2, 3])
+        with cp1:
+            _prio_opts = [p[1] for p in PRIORITIES if p[0] != 'forbidden']
+            prio_label = st.selectbox("Приоритет", _prio_opts, index=1,
+                                       key=f'_manual_prio_{video_idx}')
+        with cp2:
+            _pol_opts = [p[1] for p in INCLUDE_POLICIES if p[0] != 'forbidden']
+            pol_label = st.selectbox("Политика", _pol_opts, index=2,
+                                      key=f'_manual_policy_{video_idx}')
+        with cp3:
+            user_note = st.text_input("Заметка", key=f'_manual_note_{video_idx}')
+
+        # Action buttons
+        ab1, ab2 = st.columns(2)
+        with ab1:
+            if st.button("Создать фрагмент", key=f'_create_{video_idx}',
+                         type="primary", use_container_width=True):
+                if end_t > start_t:
+                    tag_ids   = [TAG_NAME_TO_ID.get(t, t) for t in tags_sel]
+                    prio_id   = next((p[0] for p in PRIORITIES   if p[1] == prio_label), 'normal')
+                    policy_id = next((p[0] for p in INCLUDE_POLICIES if p[1] == pol_label), 'optional')
+                    seg = ManualSegment.create(
+                        source_file=video_path,
+                        start_time=start_t,
+                        end_time=end_t,
+                        user_tags=tag_ids,
+                        priority=prio_id,
+                        include_policy=policy_id,
+                        user_note=user_note,
+                    )
+                    store.add(seg)
+                    st.success(f"Добавлен: {_fmt_ts(start_t)}–{_fmt_ts(end_t)}")
+                    st.rerun()
+                else:
+                    st.error("Начало должно быть меньше конца")
+        with ab2:
+            if st.button("Запретить участок", key=f'_forbid_{video_idx}',
+                         use_container_width=True):
+                if end_t > start_t:
+                    seg = ManualSegment.create(
+                        source_file=video_path,
+                        start_time=start_t,
+                        end_time=end_t,
+                        user_tags=['forbidden'],
+                        priority='forbidden',
+                        include_policy='forbidden',
+                    )
+                    store.add(seg)
+                    st.warning(f"Запрещено: {_fmt_ts(start_t)}–{_fmt_ts(end_t)}")
+                    st.rerun()
+                else:
+                    st.error("Начало должно быть меньше конца")
+
+        # Segment table
+        segs = store.get_for_source(video_path)
+        if segs:
+            st.write(f"**Размеченные фрагменты ({len(segs)}):**")
+            for seg_i, seg in enumerate(segs):
+                is_forb = seg.include_policy == 'forbidden'
+                is_req  = seg.include_policy in ('required', 'recommended')
+                sc1, sc2, sc3, sc4, sc5 = st.columns([2, 3, 2, 1, 1])
+                with sc1:
+                    st.write(f"`{_fmt_ts(seg.start_time)}` – `{_fmt_ts(seg.end_time)}`")
+                    st.caption(f"{seg.duration:.1f}с")
+                with sc2:
+                    _tnames = ", ".join(TAG_NAMES.get(t, t) for t in seg.user_tags) or "—"
+                    st.write(_tnames)
+                with sc3:
+                    _pname = next(
+                        (p[1] for p in INCLUDE_POLICIES if p[0] == seg.include_policy),
+                        seg.include_policy,
+                    )
+                    st.write(("🚫 " if is_forb else "✅ " if is_req else "") + _pname)
+                with sc4:
+                    if st.button("✏️", key=f'_edit_{video_idx}_{seg_i}_{seg.manual_segment_id[:6]}',
+                                 help="Загрузить в поля ввода"):
+                        st.session_state[_sk] = seg.start_time
+                        st.session_state[_ek] = seg.end_time
+                        st.rerun()
+                with sc5:
+                    if st.button("🗑", key=f'_del_{video_idx}_{seg_i}_{seg.manual_segment_id[:6]}',
+                                 help="Удалить"):
+                        store.delete(seg.manual_segment_id)
+                        st.rerun()
+            if st.button(f"Очистить разметку {filename}",
+                         key=f'_clrsrc_{video_idx}'):
+                store.clear_for_source(video_path)
+                st.rerun()
+        else:
+            st.caption("Нет размеченных фрагментов. Используйте инструменты выше.")
+
+
+def _show_manual_markup_ui(video_paths: list, project_dir: str) -> None:
+    """Render the full manual markup screen (Step 2 'Разметить вручную' mode)."""
+    from src.preprocessing.manual_segments import ManualSegmentsStore
+
+    store    = ManualSegmentsStore(project_dir)
+    all_segs = store.get_all()
+
+    st.markdown("### Разметка исходных материалов")
+    st.caption(
+        "Просмотрите исходные видео, выделите нужные участки "
+        "и назначьте им роли для монтажа."
+    )
+
+    # Summary metrics
+    n_total    = len(all_segs)
+    n_req      = sum(1 for s in all_segs if s.include_policy in ('required', 'recommended'))
+    n_forb     = sum(1 for s in all_segs if s.include_policy == 'forbidden')
+    mc1, mc2, mc3, mc4 = st.columns(4)
+    mc1.metric("Фрагментов", n_total)
+    mc2.metric("Обязательных", n_req)
+    mc3.metric("Запрещённых", n_forb)
+    mc4.metric("Видео", len(video_paths))
+
+    st.write("---")
+
+    for vidx, vpath in enumerate(video_paths):
+        _show_video_markup_block(vpath, vidx, store)
+
+    st.write("---")
+
+    # Bottom action bar
+    ba1, ba2, ba3, ba4 = st.columns(4)
+    with ba1:
+        _confirmed = st.session_state.get('prep_manual_confirmed', False)
+        btn_label  = (
+            f"✅ Подтверждено ({n_total})" if _confirmed
+            else f"Подтвердить разметку ({n_total})"
+        )
+        if st.button(btn_label, key="manual_confirm",
+                     type="primary", use_container_width=True,
+                     disabled=(n_total == 0)):
+            st.session_state.prep_manual_confirmed = True
+            st.toast(f"Разметка подтверждена: {n_total} фрагментов", icon="✅")
+            st.rerun()
+    with ba2:
+        if st.button("Очистить всё", key="manual_clear_all", use_container_width=True):
+            store.clear_all()
+            st.session_state.prep_manual_confirmed = False
+            st.rerun()
+    with ba3:
+        if st.button("↩ Сменить режим", key="manual_change_mode", use_container_width=True):
+            st.session_state.prep_mode            = None
+            st.session_state.prep_manual_confirmed = False
+            st.rerun()
+    with ba4:
+        if st.button("⏭ Пропустить", key="manual_skip", use_container_width=True):
+            st.session_state.prep_mode = 'skipped'
+            st.rerun()
+
+    st.write("")
+    if st.session_state.get('prep_manual_confirmed'):
+        st.success(
+            "Разметка подтверждена. Перейдите к настройкам монтажа и нажмите Генерировать."
+        )
+    elif n_total > 0:
+        st.info(
+            f"Размечено {n_total} фрагментов. Нажмите «Подтвердить разметку» перед генерацией."
+        )
+    else:
+        st.warning("Добавьте хотя бы один фрагмент, затем подтвердите разметку.")
+
+
+def show_material_prep_section():
+    """
+    Optional preprocessing stage: find best video fragments + music segments.
+    Called from show_welcome_screen(). Sets session_state.prep_approved_ids and
+    session_state.prep_music_range which are later used by render_video().
+    """
+    video_paths = st.session_state.get('selected_videos') or []
+    if not video_paths:
+        return
+
+    project_dir = str(Path(video_paths[0]).parent)
+    music_path: Optional[str] = st.session_state.get('music_path')
+    prep_mode = st.session_state.get('prep_mode')
+
+    # ------------------------------------------------------------------
+    # Running state: perform analysis synchronously
+    # ------------------------------------------------------------------
+    if prep_mode == 'running':
+        _force = bool(st.session_state.pop('_prep_force_reanalyze', False))
+        _run_prep_analysis(project_dir, music_path, force=_force)
+        st.session_state.prep_mode = 'done'
+        st.rerun()
+        return
+
+    # ------------------------------------------------------------------
+    # Expander
+    # ------------------------------------------------------------------
+    _approved_ids = st.session_state.get('prep_approved_ids')
+    n_approved = len(_approved_ids) if _approved_ids is not None else None
+    badge = (
+        "✓ выбрано" if prep_mode == 'done' else
+        "⏭ пропущено" if prep_mode == 'skipped' else
+        ""
+    )
+    label = f"🎬 Подготовка материалов для монтажа  {badge}"
+    expanded = prep_mode == 'done'
+
+    with st.expander(label, expanded=expanded):
+        st.caption(
+            "Сервис может заранее найти лучшие фрагменты в ваших видео и лучшие участки музыки, "
+            "чтобы использовать в монтаже только подходящие материалы. Это повышает качество "
+            "итогового ролика, особенно если в папке много случайных или неудачных видео."
+        )
+
+        # -- Not yet started --
+        if prep_mode is None:
+            st.write("Выберите режим подготовки:")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                if st.button("⏭ Пропустить", key="prep_skip", use_container_width=True,
+                             help="Использовать все видео без отбора"):
+                    st.session_state.prep_mode = 'skipped'
+                    st.session_state.prep_approved_ids = None
+                    st.session_state.prep_music_range = None
+                    st.rerun()
+            with c2:
+                if st.button("⚡ Авто", key="prep_auto", use_container_width=True, type="primary",
+                             help="Найти лучшие фрагменты и сразу применить"):
+                    st.session_state.prep_mode = 'running'
+                    st.session_state._prep_auto_confirm = True
+                    st.rerun()
+            with c3:
+                if st.button("🔍 Авто + ревью", key="prep_review", use_container_width=True,
+                             help="Найти лучшие и дать вам возможность проверить"):
+                    st.session_state.prep_mode = 'running'
+                    st.session_state._prep_auto_confirm = False
+                    st.rerun()
+            c4, c5, _ = st.columns(3)
+            with c4:
+                if st.button("📋 Авто + просмотр", key="prep_manual", use_container_width=True,
+                             help="Загрузить все фрагменты и выбрать самому"):
+                    st.session_state.prep_mode = 'running'
+                    st.session_state._prep_auto_confirm = False
+                    st.rerun()
+            with c5:
+                if st.button("✏️ Разметить вручную", key="prep_manual_markup",
+                             use_container_width=True, type="primary",
+                             help="Открыть каждое видео и вручную выделить нужные участки"):
+                    st.session_state.prep_mode = 'manual'
+                    st.session_state.prep_manual_confirmed = False
+                    st.rerun()
+            return
+
+        # -- Manual markup mode --
+        if prep_mode == 'manual':
+            _show_manual_markup_ui(video_paths, project_dir)
+            return
+
+        # -- Skipped --
+        if prep_mode == 'skipped':
+            st.info("Подготовка пропущена — будут использованы все видео и вся музыка.")
+            if st.button("Изменить режим", key="prep_change_from_skip"):
+                st.session_state.prep_mode = None
+                st.rerun()
+            return
+
+        # -- Done: show results --
+        video_frags: list = st.session_state.get('prep_video_frags', [])
+        music_frags: list = st.session_state.get('prep_music_frags', [])
+
+        # Auto-confirm on first load if requested
+        if st.session_state.get('_prep_auto_confirm') and _approved_ids is None:
+            good_ids = {f['id'] for f in video_frags if f['quality_score'] >= 0.55}
+            st.session_state.prep_approved_ids = good_ids or {f['id'] for f in video_frags}
+            if music_frags:
+                best_mf = max(music_frags, key=lambda x: x.get('montage_score', 0))
+                st.session_state.prep_music_range = (best_mf['start_s'], best_mf['end_s'])
+            st.session_state._prep_auto_confirm = False
+            _approved_ids = st.session_state.prep_approved_ids
+            st.rerun()
+
+        _approved_ids = st.session_state.get('prep_approved_ids')
+
+        # ── Video fragments section ─────────────────────────────────────────
+        st.write("---")
+        n_total = len(video_frags)
+        n_good  = sum(1 for f in video_frags if f['quality_score'] >= 0.55)
+        n_sel   = len(_approved_ids) if _approved_ids is not None else n_total
+        st.write(f"**🎥 Видео для монтажа** — {n_sel} выбрано / {n_total} всего ({n_good} хороших)")
+
+        # Quick-action bar
+        qa1, qa2, qa3, qa4 = st.columns(4)
+        with qa1:
+            if st.button("✅ Все хорошие", key="prep_sel_good", use_container_width=True):
+                st.session_state.prep_approved_ids = {f['id'] for f in video_frags if f['quality_score'] >= 0.55}
+                st.rerun()
+        with qa2:
+            if st.button("🏆 Только лучшие", key="prep_sel_best", use_container_width=True):
+                st.session_state.prep_approved_ids = {f['id'] for f in video_frags if f['quality_score'] >= 0.70}
+                st.rerun()
+        with qa3:
+            if st.button("📋 Выбрать все", key="prep_sel_all", use_container_width=True):
+                st.session_state.prep_approved_ids = {f['id'] for f in video_frags}
+                st.rerun()
+        with qa4:
+            if st.button("🚫 Снять всё", key="prep_desel_all", use_container_width=True):
+                st.session_state.prep_approved_ids = set()
+                st.rerun()
+
+        if not video_frags:
+            st.warning("Видеофрагменты не найдены. Попробуйте пересчитать анализ.")
+        else:
+            _approved_ids = st.session_state.get('prep_approved_ids')
+            # Show in 3-column card grid
+            cols_per_row = 3
+            for row_start in range(0, min(len(video_frags), 60), cols_per_row):
+                row_frags = video_frags[row_start:row_start + cols_per_row]
+                row_cols = st.columns(cols_per_row)
+                for col, frag in zip(row_cols, row_frags):
+                    fid = frag['id']
+                    is_sel = (_approved_ids is None) or (fid in _approved_ids)
+                    with col:
+                        # Thumbnail
+                        thumb = frag.get('thumbnail_path')
+                        if thumb and Path(thumb).exists():
+                            st.image(thumb, use_container_width=True)
+                        else:
+                            q = frag['quality_score']
+                            bar = int(q * 10)
+                            st.markdown(
+                                f"<div style='background:#1e2130;border-radius:6px;padding:16px;"
+                                f"text-align:center;font-size:1.5em'>{'█' * bar}{'░' * (10 - bar)}</div>",
+                                unsafe_allow_html=True
+                            )
+                        st.caption(
+                            f"**{frag['filename']}**  "
+                            f"{_fmt_ts(frag['start_s'])}–{_fmt_ts(frag['end_s'])}  "
+                            f"({frag['duration_s']:.1f}с)"
+                        )
+                        st.caption(
+                            f"{_video_frag_status(frag['quality_score'])} "
+                            f"· Q={frag['quality_score']:.2f}"
+                        )
+                        cb_key = f"prep_frag_{fid}"
+                        checked = st.checkbox(
+                            "Включить в монтаж",
+                            value=is_sel,
+                            key=cb_key,
+                        )
+                        if checked != is_sel:
+                            cur = set(_approved_ids) if _approved_ids is not None else {f['id'] for f in video_frags}
+                            if checked:
+                                cur.add(fid)
+                            else:
+                                cur.discard(fid)
+                            st.session_state.prep_approved_ids = cur
+                            st.rerun()
+
+            if n_total > 60:
+                st.caption(f"Показано 60 из {n_total} фрагментов (остальные включены автоматически если выбраны хорошие)")
+
+        # ── Music fragments section ─────────────────────────────────────────
+        if music_path:
+            st.write("---")
+            st.write("**🎵 Музыка для монтажа**")
+
+            cur_range = st.session_state.get('prep_music_range')
+
+            if not music_frags:
+                st.warning("Музыкальные участки не найдены или librosa недоступна.")
+                st.caption("Будет использоваться весь трек.")
+            else:
+                from src.preprocessing.music_fragment_analyzer import (
+                    fragment_type_label, fragment_type_emoji
+                )
+
+                # Music mode selector
+                music_mode = st.radio(
+                    "Использовать музыку:",
+                    options=['auto', 'whole', 'manual'],
+                    format_func=lambda x: {
+                        'auto': '🤖 Лучший участок (авто)',
+                        'whole': '🎵 Весь трек',
+                        'manual': '✂️ Вручную',
+                    }[x],
+                    index=0 if cur_range is not None else 1,
+                    horizontal=True,
+                    key='prep_music_mode',
+                )
+
+                if music_mode == 'whole':
+                    st.session_state.prep_music_range = None
+
+                elif music_mode == 'auto':
+                    best_mf = max(music_frags, key=lambda x: x.get('montage_score', 0))
+                    st.session_state.prep_music_range = (best_mf['start_s'], best_mf['end_s'])
+                    cur_range = st.session_state.prep_music_range
+
+                elif music_mode == 'manual':
+                    import librosa as _lr_check
+                    try:
+                        _lr_check
+                        # Try to get track duration from first fragment
+                        _total_dur = music_frags[-1]['end_s'] if music_frags else 300.0
+                    except Exception:
+                        _total_dur = 300.0
+
+                    mc1, mc2 = st.columns(2)
+                    _ms_def = cur_range[0] if cur_range else 0.0
+                    _me_def = cur_range[1] if cur_range else min(_total_dur, 60.0)
+                    with mc1:
+                        _ms = st.number_input("Начало (с)", min_value=0.0, max_value=_total_dur,
+                                              value=_ms_def, step=1.0, key='prep_music_start_manual')
+                    with mc2:
+                        _me = st.number_input("Конец (с)", min_value=0.0, max_value=_total_dur,
+                                              value=_me_def, step=1.0, key='prep_music_end_manual')
+                    if _me > _ms:
+                        st.session_state.prep_music_range = (_ms, _me)
+
+                # Show fragment list
+                for _mfi, mf in enumerate(music_frags):
+                    ftype  = mf.get('fragment_type', 'calm')
+                    emoji  = fragment_type_emoji(ftype)
+                    label  = fragment_type_label(ftype)
+                    start  = mf['start_s']
+                    end    = mf['end_s']
+                    dur    = mf['duration_s']
+                    energy = mf.get('energy_score', 0)
+                    rhythm = mf.get('rhythm_score', 0)
+                    score  = mf.get('montage_score', 0)
+                    reason = mf.get('reason', '')
+                    status = mf.get('status', 'recommended')
+                    mfid   = mf.get('id') or _mfi  # DB id if available, else loop index
+
+                    is_cur = (cur_range is not None and
+                              abs(cur_range[0] - start) < 0.5 and
+                              abs(cur_range[1] - end) < 0.5)
+
+                    with st.container():
+                        border_color = '#4f8ef7' if is_cur else '#2d3148'
+                        status_badge = {'best': '🏆 Лучший', 'recommended': '✅ Рекомендован'}.get(status, '')
+                        energy_bar = '▪' * int(energy * 10) + '░' * (10 - int(energy * 10))
+
+                        st.markdown(
+                            f"<div style='border:1px solid {border_color};border-radius:8px;"
+                            f"padding:10px 14px;margin-bottom:6px;background:#12141f'>"
+                            f"<b>{emoji} {label}</b>  "
+                            f"<code>{_fmt_ts(start)} – {_fmt_ts(end)}</code>  "
+                            f"({dur:.0f}с)  {status_badge}<br>"
+                            f"<small>Энергия: {energy_bar}  Ритм: {rhythm:.2f}  "
+                            f"Монтаж: {score:.2f}  — {reason}</small>"
+                            + (f"<br><small style='color:#f0a'>⚠ {mf.get('warnings')}</small>"
+                               if mf.get('warnings') else "")
+                            + "</div>",
+                            unsafe_allow_html=True,
+                        )
+                        mc1, mc2, mc3 = st.columns([2, 1, 1])
+                        with mc1:
+                            if st.button(f"✅ Выбрать этот участок",
+                                         key=f"mf_sel_{mfid}",
+                                         use_container_width=True,
+                                         type="primary" if is_cur else "secondary"):
+                                st.session_state.prep_music_range = (start, end)
+                                st.rerun()
+                        with mc2:
+                            if st.button("🚫 Исключить", key=f"mf_excl_{mfid}",
+                                         use_container_width=True):
+                                # Mark excluded in DB
+                                _vid_dirs = list({str(Path(vp).parent) for vp in video_paths})
+                                for _vd in _vid_dirs:
+                                    try:
+                                        from src.storage.analysis_db import AnalysisDB as _ADB2
+                                        _db2 = _ADB2(_vd)
+                                        _db2.update_music_fragment_user_selection(mfid, False, excluded_by_user=True)
+                                    except Exception:
+                                        pass
+                                new_mf = [m for m in music_frags if m.get('id') != mfid]
+                                st.session_state.prep_music_frags = new_mf
+                                st.rerun()
+
+        # ── Confirm / Recalculate / Reset bar ──────────────────────────────
+        st.write("---")
+        act1, act2, act3 = st.columns(3)
+        with act1:
+            _n_now = len(st.session_state.get('prep_approved_ids') or video_frags)
+            if st.button(f"✅ Подтвердить выбор ({_n_now} фрагментов)",
+                         key="prep_confirm", type="primary", use_container_width=True):
+                # Approved IDs are already in session_state; just signal ready
+                if st.session_state.prep_approved_ids is None:
+                    st.session_state.prep_approved_ids = {f['id'] for f in video_frags}
+                st.toast(f"Выбор подтверждён: {len(st.session_state.prep_approved_ids)} фрагментов", icon="✅")
+        with act2:
+            if st.button("🔄 Пересчитать анализ", key="prep_recalc", use_container_width=True):
+                st.session_state.prep_mode = 'running'
+                st.session_state.prep_video_frags = []
+                st.session_state.prep_music_frags = []
+                st.rerun()
+        with act3:
+            if st.button("↩ Сбросить выбор", key="prep_reset", use_container_width=True):
+                st.session_state.prep_mode = None
+                st.session_state.prep_approved_ids = None
+                st.session_state.prep_music_range = None
+                st.session_state.prep_video_frags = []
+                st.session_state.prep_music_frags = []
+                st.rerun()
+
+        # Warn if too few fragments selected
+        _n_sel = len(st.session_state.get('prep_approved_ids') or {})
+        _tgt = st.session_state.get('target_duration') or 60
+        _total_sel_dur = sum(
+            f['duration_s'] for f in video_frags
+            if (st.session_state.get('prep_approved_ids') is None or
+                f['id'] in (st.session_state.get('prep_approved_ids') or set()))
+        )
+        if _n_sel > 0 and _total_sel_dur < _tgt:
+            st.warning(
+                f"⚠️ Суммарная длительность выбранных фрагментов ({_total_sel_dur:.0f}с) "
+                f"меньше заданной длительности ролика ({_tgt:.0f}с). "
+                "Выберите больше фрагментов или уменьшите длительность ролика."
+            )
+
+        # Music range mismatch warning
+        _mrange = st.session_state.get('prep_music_range')
+        if _mrange and _tgt:
+            _music_dur = _mrange[1] - _mrange[0]
+            if _music_dur < _tgt * 0.8:
+                st.warning(
+                    f"⚠️ Выбранный музыкальный участок ({_music_dur:.0f}с) короче длительности ролика ({_tgt:.0f}с). "
+                    "Участок будет зациклен или расширен автоматически."
+                )
+
+
+def _show_step_indicator(current_step: int):
+    """Render a 3-step progress bar at the top of the wizard."""
+    steps = [
+        (1, "📁 Материалы"),
+        (2, "🔬 Подготовка"),
+        (3, "🎨 Настройки"),
+    ]
+    html_parts = []
+    for step_num, label in steps:
+        is_active = step_num == current_step
+        is_done = step_num < current_step
+        if is_done:
+            color = "#4ec9b0"
+            dot = "✓"
+            weight = "normal"
+        elif is_active:
+            color = "#4f8ef7"
+            dot = "●"
+            weight = "bold"
+        else:
+            color = "#6e7681"
+            dot = "○"
+            weight = "normal"
+        html_parts.append(
+            f"<span style='color:{color};font-weight:{weight};font-size:0.95rem'>"
+            f"{dot} {label}</span>"
+        )
+    separator = "<span style='color:#30363d;margin:0 12px'>─────</span>"
+    st.markdown(
+        "<div style='text-align:center;padding:6px 0'>"
+        + separator.join(html_parts)
+        + "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+_STYLE_CATS = [
+    ('all',       '📋 Все',       None),
+    ('action',    '⚡ Экшен',     ['easy_mode', 'f4', 'sport_dynamic_cut', 'sport_highlight_impact', 'fast_action_sport']),
+    ('cinematic', '🎬 Кино',      ['f1', 'f2', 'f5', 'calm_minimal_documentary', 'intelligent_beauty_mix', 'drone_nature_cinematic']),
+    ('travel',    '🌍 Travel',    ['f6', 'travel_story', 'drone_landscape_clean']),
+    ('lifestyle', '📱 Lifestyle', ['f3', 'urban_city_rhythm', 'social_media_punchy', 'event_highlights']),
+    ('business',  '💼 Бизнес',   ['business_promo_clean', 'real_estate_property_tour']),
+    ('other',     '⚙️ Прочее',   ['manual']),
+]
+
+
 def _show_compact_style_grid(presets: list, current_pid: str) -> None:
-    """
-    2-column grid of style buttons. Clicking a button selects the style.
-    Shows emoji+name as label, full description in tooltip (help=).
-    Active style is visually indicated with a ▶ prefix.
-    """
+    """Category-filtered style picker with info card for selected style."""
+    preset_map = {p['preset_id']: p for p in presets}
+
+    # ── Selected style info card ──────────────────────────────────────────────
+    if current_pid and current_pid in preset_map:
+        sel = preset_map[current_pid]
+        desc = (sel.get('description') or '').strip()
+        st.markdown(
+            f"<div style='background:#1e2130;border-radius:8px;padding:8px 12px;"
+            f"margin-bottom:8px;border-left:3px solid #4f8ef7'>"
+            f"<span style='font-size:1.1em'>{sel['emoji']} <b>{sel['name']}</b></span>"
+            + (f"<br><span style='font-size:0.82em;color:#a0aec0'>{desc[:120]}</span>" if desc else "")
+            + "</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.caption("Выберите стиль монтажа")
+
+    # ── Category filter (2 rows × 3 cols) ────────────────────────────────────
+    cat_cols = st.columns(3)
+    for idx, (cid, clabel, _) in enumerate(_STYLE_CATS):
+        col = cat_cols[idx % 3]
+        is_active = st.session_state.style_filter_cat == cid
+        with col:
+            if st.button(
+                clabel,
+                key=f"cat_{cid}",
+                use_container_width=True,
+                type="primary" if is_active else "secondary",
+            ):
+                st.session_state.style_filter_cat = cid
+                st.rerun()
+
+    st.write("")  # small spacer
+
+    # ── Filter presets by selected category ──────────────────────────────────
+    active_cat = st.session_state.style_filter_cat
+    if active_cat == 'all':
+        visible = presets
+    else:
+        allowed = next((ids for cid, _, ids in _STYLE_CATS if cid == active_cat), None) or []
+        visible = [p for p in presets if p['preset_id'] in allowed]
+
+    if not visible:
+        st.caption("Нет стилей в этой категории")
+        return
+
+    # ── 2-col button grid ────────────────────────────────────────────────────
     n_cols = 2
-    for i in range(0, len(presets), n_cols):
-        row_presets = presets[i:i + n_cols]
+    for i in range(0, len(visible), n_cols):
+        row_presets = visible[i:i + n_cols]
         row_cols = st.columns(n_cols)
         for col, p in zip(row_cols, row_presets):
-            pid   = p['preset_id']
+            pid    = p['preset_id']
             is_sel = pid == current_pid
             label  = f"{'▶ ' if is_sel else ''}{p['emoji']} {p['name']}"
             tip    = (p.get('description', '') or '')[:160]
@@ -1334,10 +2273,22 @@ def show_quality_analysis_section(selected_videos: list):
             f"{stats['analyzed_files']}/{len(selected_videos)} файлов · "
             f"{time_ago}"
         )
-        col_view, col_reanalyze, _ = st.columns([2, 2, 3])
+        col_view, col_oneclick, col_reanalyze = st.columns([2, 2, 2])
         with col_view:
             if st.button('📋 Посмотреть фрагменты', key='qa_view_btn', use_container_width=True):
                 st.session_state['show_fragment_viewer'] = True
+        with col_oneclick:
+            if st.button('⚡ Один клик', key='qa_oneclick_btn',
+                         use_container_width=True, help='Автовыбор стиля по материалу и музыке'):
+                try:
+                    from src.preprocessing.auto_style import auto_select_style
+                    _music = st.session_state.get('selected_audio')
+                    _auto_style = auto_select_style(project_dir, _music)
+                    st.session_state.selected_preset_id = _auto_style
+                    save_draft_state()
+                    st.rerun()
+                except Exception as _e:
+                    st.error(f'Ошибка автовыбора: {_e}')
         with col_reanalyze:
             if st.button('🔄 Обновить анализ', key='qa_reanalyze_btn', use_container_width=True):
                 st.session_state['qa_force_reanalyze'] = True
@@ -1357,11 +2308,22 @@ def show_quality_analysis_section(selected_videos: list):
         with col_skip:
             st.caption('или пропустите — система сработает без анализа')
 
+        # CLIP tagging option (Level 4) — optional, shown as expandable hint
+        with st.expander('🔬 Расширенный анализ (Level 4)', expanded=False):
+            enable_clip = st.checkbox(
+                'Семантические теги сцен (CLIP)',
+                value=False,
+                key='qa_enable_clip',
+                help='Классифицирует каждую сцену (природа, город, интерьер…). '
+                     'Требует open_clip-torch. Работает на CPU/CUDA/MPS. Медленнее.',
+            )
+            if enable_clip:
+                st.caption('⚠️ Включение CLIP снижает скорость анализа (модель ~600 МБ, 1 поток).')
+
         if do_analyze or st.session_state.get('qa_force_reanalyze'):
             st.session_state.pop('qa_force_reanalyze', None)
             progress_bar = st.progress(0.0)
             status_text = st.empty()
-            frag_count = st.empty()
 
             def _on_progress(filename: str, done: int, total: int):
                 progress_bar.progress(done / total)
@@ -1372,6 +2334,7 @@ def show_quality_analysis_section(selected_videos: list):
                     project_dir,
                     progress_callback=_on_progress,
                     force_reanalyze=st.session_state.get('qa_force_reanalyze', False),
+                    enable_clip_tagging=st.session_state.get('qa_enable_clip', False),
                 )
                 progress_bar.empty()
                 status_text.empty()
@@ -1385,6 +2348,15 @@ def show_quality_analysis_section(selected_videos: list):
 def _fragment_tags(f) -> str:
     """Build tag line for a fragment card based on content and motion metrics."""
     tags = []
+    # CLIP semantic tag (Level 4)
+    scene_tag = getattr(f, 'scene_tag', None)
+    if scene_tag:
+        try:
+            from src.preprocessing.clip_tagger import tag_label_ru
+            tags.append(tag_label_ru(scene_tag))
+        except Exception:
+            tags.append(scene_tag)
+    # Shot type from MediaPipe (Level 2)
     scene_type = getattr(f, 'scene_type', None) or ''
     if scene_type == 'close':
         tags.append('🔍 крупный')
@@ -1440,7 +2412,29 @@ def _show_fragment_viewer(project_dir: str, db=None):
                     lib.reset_approval(_f.id)
                 st.rerun()
 
-    fragments = lib.get_fragments_for_ui(min_quality=min_q, sort_by=sort_opt, limit=60)
+    # CLIP tag filter (Level 4) — shown only when tags exist in DB
+    selected_tags = None
+    try:
+        available_tags = db.get_available_scene_tags()
+        if available_tags:
+            try:
+                from src.preprocessing.clip_tagger import TAG_LABELS_RU
+                tag_display = {t: TAG_LABELS_RU.get(t, t) for t in available_tags}
+            except Exception:
+                tag_display = {t: t for t in available_tags}
+            chosen = st.multiselect(
+                '🔬 Фильтр по тегу сцены',
+                options=list(tag_display.keys()),
+                format_func=lambda t: tag_display[t],
+                key='fv_tag_filter',
+            )
+            selected_tags = chosen if chosen else None
+    except Exception:
+        pass
+
+    fragments = lib.get_fragments_for_ui(
+        min_quality=min_q, sort_by=sort_opt, limit=60, scene_tags=selected_tags
+    )
 
     if not fragments:
         st.info('Нет фрагментов с указанным минимальным качеством.')
@@ -1492,6 +2486,90 @@ def _show_fragment_viewer(project_dir: str, db=None):
                 if st.button(lbl, key=f'priority_{f.id}', help='Приоритет'):
                     lib.mark_priority(f.id, not is_priority)
                     st.rerun()
+
+
+def show_render_history_section(selected_videos: list):
+    """
+    Render history section (Idea 4): shows past renders with style, clip count,
+    date, star rating, and open/download buttons.
+    """
+    if not selected_videos:
+        return
+    project_dir = _get_project_dir_from_videos(selected_videos)
+    if not project_dir:
+        return
+
+    try:
+        from src.storage.analysis_db import AnalysisDB
+        db = AnalysisDB(project_dir)
+        rows = db.get_render_history(project_dir=project_dir, limit=20)
+    except Exception:
+        return
+
+    if not rows:
+        return
+
+    with st.expander(f'🕑 История рендеров ({len(rows)})', expanded=False):
+        for row in rows:
+            import datetime as _dt
+            created = row['created_at'] or ''
+            try:
+                dt = _dt.datetime.fromisoformat(created)
+                date_str = dt.strftime('%d.%m  %H:%M')
+            except Exception:
+                date_str = created[:16]
+
+            output = row['output_path'] or ''
+            exists = bool(output) and Path(output).exists()
+            style_label = row['style_name'] or row['style_id'] or '—'
+            clips = row['clip_count'] or 0
+            dur = row['duration_s'] or 0
+            dur_str = f'{int(dur // 60)}:{int(dur % 60):02d}' if dur else '—'
+            rating = row['user_rating']
+            stars = ('★' * rating + '☆' * (5 - rating)) if rating else '☆☆☆☆☆'
+
+            col_info, col_stars, col_actions = st.columns([3, 2, 3])
+            with col_info:
+                st.markdown(
+                    f'**{date_str}**  ·  {style_label}  ·  '
+                    f'{clips} клипов  ·  {dur_str}'
+                )
+                if output:
+                    fn = Path(output).name if output else ''
+                    st.caption(fn)
+            with col_stars:
+                new_rating = st.select_slider(
+                    'Оценка',
+                    options=[1, 2, 3, 4, 5],
+                    value=rating or 3,
+                    key=f'rh_rating_{row["id"]}',
+                    label_visibility='collapsed',
+                )
+                if new_rating != rating:
+                    try:
+                        db.set_render_rating(row['id'], new_rating)
+                        st.rerun()
+                    except Exception:
+                        pass
+            with col_actions:
+                btn_cols = st.columns(3)
+                with btn_cols[0]:
+                    if exists and st.button('📂', key=f'rh_folder_{row["id"]}',
+                                            help='Открыть папку'):
+                        os.system(f'open "{Path(output).parent}"')
+                with btn_cols[1]:
+                    if exists and st.button('▶', key=f'rh_open_{row["id"]}',
+                                            help='Открыть файл'):
+                        os.system(f'open "{output}"')
+                with btn_cols[2]:
+                    if st.button('✕', key=f'rh_del_{row["id"]}',
+                                 help='Удалить запись из истории'):
+                        try:
+                            db.delete_render_history_entry(row['id'])
+                            st.rerun()
+                        except Exception:
+                            pass
+            st.divider()
 
 
 def show_preprocess_section(selected_videos: list):
@@ -1895,40 +2973,27 @@ def show_branding_section():
             st.session_state.watermark_opacity = wm_opac
 
 
-def show_welcome_screen():
-    """Compact three-column welcome screen — fits on one screen without scrolling."""
+def _show_wizard_step1():
+    """Step 1: Project name + video + audio selection."""
+    st.markdown("### Шаг 1: Создание проекта и выбор материалов")
 
-    # ── Compact header row ────────────────────────────────────────────────────
-    hdr_a, hdr_b = st.columns([4, 2], gap="small")
-    with hdr_a:
-        project_name = st.text_input(
-            "Название проекта",
-            value=st.session_state.get('project_name', ''),
-            placeholder="Мой видео проект",
-            key="welcome_project_name",
-            label_visibility="collapsed",
-        )
-        if project_name:
-            st.session_state.project_name = project_name
-            save_draft_state()
-        if not project_name:
-            st.caption("✏️ Введите название проекта")
-    with hdr_b:
-        # Mini status line
-        n_vid = len(st.session_state.get('selected_videos', []))
-        has_aud = bool(st.session_state.get('selected_audio'))
-        has_pid = bool(st.session_state.get('selected_preset_id'))
-        parts = []
-        parts.append(f"{'✅' if n_vid else '○'} {n_vid} видео")
-        parts.append(f"{'✅' if has_aud else '○'} аудио")
-        parts.append(f"{'✅' if has_pid else '○'} стиль")
-        st.caption("  ·  ".join(parts))
+    project_name = st.text_input(
+        "Название проекта",
+        value=st.session_state.get('project_name', ''),
+        placeholder="Мой видео проект",
+        key="welcome_project_name",
+    )
+    if project_name:
+        st.session_state.project_name = project_name
+        save_draft_state()
+    if not project_name:
+        st.caption("✏️ Введите название проекта")
 
-    # ── Three-column main layout ───────────────────────────────────────────────
-    left_col, mid_col, right_col = st.columns([3, 3, 4], gap="medium")
+    st.divider()
 
-    with left_col:
-        # ── Video ──────────────────────────────────────────────────────────
+    col_vid, col_aud = st.columns(2, gap="large")
+
+    with col_vid:
         st.write("**📹 Видео**")
         cv1, cv2 = st.columns(2)
         with cv1:
@@ -1964,7 +3029,8 @@ def show_welcome_screen():
             new_sel = st.multiselect(
                 "Выберите видео",
                 options=st.session_state.available_videos,
-                default=[v for v in st.session_state.selected_videos if v in st.session_state.available_videos],
+                default=[v for v in st.session_state.selected_videos
+                         if v in st.session_state.available_videos],
                 format_func=lambda x: Path(x).name,
                 key="video_multiselect",
                 label_visibility="collapsed"
@@ -1975,7 +3041,7 @@ def show_welcome_screen():
         if st.session_state.selected_videos:
             st.caption(f"✓ Выбрано: {len(st.session_state.selected_videos)} файл(ов)")
 
-        # ── Audio ──────────────────────────────────────────────────────────
+    with col_aud:
         st.write("**🎵 Аудио**")
         ca1, ca2 = st.columns(2)
         with ca1:
@@ -2020,9 +3086,815 @@ def show_welcome_screen():
 
         if st.session_state.selected_audio:
             st.caption(f"✓ {Path(st.session_state.selected_audio).name}")
+            _music_path = st.session_state.selected_audio
+            try:
+                from src.preprocessing.music_style_advisor import get_top_suggestions
+                _suggestions = get_top_suggestions(_music_path, n=2)
+                if _suggestions:
+                    _top = _suggestions[0]
+                    _hint = f'🎵 Музыка подходит для **{_top.name}** — {_top.reason}'
+                    if len(_suggestions) > 1:
+                        _hint += f'  \nАльтернатива: {_suggestions[1].name}'
+                    st.caption(_hint)
+                    if st.button(
+                        f'Применить стиль {_top.name}',
+                        key='apply_music_style_btn',
+                        use_container_width=True,
+                    ):
+                        st.session_state.selected_preset_id = _top.style_id
+                        save_draft_state()
+                        st.rerun()
+            except Exception:
+                pass
 
-    with mid_col:
-        # ── Platform ─────────────────────────────────────────────────────────
+    # Navigation
+    st.divider()
+    _nav1, _nav2, _nav3 = st.columns([1, 3, 1])
+    with _nav2:
+        errors = []
+        if not st.session_state.get('project_name'):
+            errors.append("название проекта")
+        if not st.session_state.get('selected_videos'):
+            errors.append("видео файлы")
+        if errors:
+            st.caption("⚠️ Заполните: " + ", ".join(errors))
+        can_next = not bool(errors)
+        if st.button(
+            "Далее: Подготовка материалов →",
+            type="primary",
+            use_container_width=True,
+            disabled=not can_next,
+            key="step1_next",
+        ):
+            st.session_state.wizard_step = 2
+            st.rerun()
+
+
+def _get_music_clip(music_path: str, start_s: float, end_s: float) -> Optional[str]:
+    """Return cached audio preview clip path, or None on failure."""
+    try:
+        from src.preprocessing.audio_clipper import get_or_create_audio_clip
+        return get_or_create_audio_clip(music_path, start_s, end_s)
+    except Exception:
+        return None
+
+
+def _scene_is_selected(scene: dict, approved_ids) -> bool:
+    """True if any of the scene's fragment IDs are in the approved set (or no filter)."""
+    if approved_ids is None:
+        return True
+    fids = scene.get('fragment_ids') or []
+    return bool(set(fids) & approved_ids)
+
+
+def _scene_is_user_rejected(scene: dict, rejected_fids: set) -> bool:
+    """True if the user explicitly excluded this scene."""
+    if not rejected_fids:
+        return False
+    fids = set(scene.get('fragment_ids') or [])
+    return bool(fids & rejected_fids)
+
+
+def _show_scene_card(scene: dict, approved_ids, scene_key: str, rejected_fids=None):
+    """Render one scene card: media preview + info + checkbox + exclude button."""
+    if rejected_fids is None:
+        rejected_fids = st.session_state.get('prep_rejected_fids', set())
+    fids    = scene.get('fragment_ids') or []
+    is_sel  = _scene_is_selected(scene, approved_ids)
+    is_rej  = _scene_is_user_rejected(scene, rejected_fids)
+    q       = scene['quality_score']
+    ums     = scene.get('ums_score', 0.0)
+    cat     = scene.get('category', 'good')
+
+    # Category badge colors
+    _cat_cfg = {
+        'best':   ('#4ec9b0', '🏆 Лучшее'),
+        'good':   ('#4f8ef7', '✅ Хорошее'),
+        'backup': ('#e0a030', '🔄 Запасное'),
+        'rejected_by_system': ('#6e7681', '⚫ Слабое'),
+    }
+    badge_color, badge_label = _cat_cfg.get(cat, ('#6e7681', cat))
+
+    # Dim rejected cards
+    opacity = '0.40' if is_rej else '1.0'
+
+    # Category badge
+    st.markdown(
+        f"<div style='display:inline-block;padding:2px 8px;border-radius:10px;"
+        f"background:{badge_color}22;border:1px solid {badge_color};"
+        f"color:{badge_color};font-size:0.75rem;opacity:{opacity}'>"
+        f"{badge_label}</div>",
+        unsafe_allow_html=True,
+    )
+
+    # Media (video clip → existing preview → thumbnail → quality bar)
+    clip_path  = scene.get('clip_path')
+    prev_path  = scene.get('preview_path')
+    thumb_path = scene.get('thumbnail_path')
+
+    if clip_path and Path(clip_path).exists():
+        st.video(clip_path)
+    elif prev_path and Path(prev_path).exists():
+        st.video(prev_path)
+    elif thumb_path and Path(thumb_path).exists():
+        st.image(thumb_path, use_container_width=True)
+    else:
+        bar = int(q * 10)
+        st.markdown(
+            f"<div style='background:#1e2130;border-radius:6px;padding:14px;"
+            f"text-align:center;font-size:1.05em;opacity:{opacity}'>"
+            f"{'█' * bar}{'░' * (10 - bar)}</div>",
+            unsafe_allow_html=True,
+        )
+
+    # Info captions
+    st.caption(
+        f"{_fmt_ts(scene['start_s'])}–{_fmt_ts(scene['end_s'])} "
+        f"({scene['duration_s']:.1f}с)"
+    )
+    score_str = f"UMS={ums:.2f}" if ums > 0 else f"Q={q:.2f}"
+    st.caption(
+        f"{score_str} · ст={scene.get('stability',0):.2f} "
+        f"· рез={scene.get('sharpness',0):.2f}"
+    )
+    beat_sync = scene.get('beat_sync_score', 0.0)
+    if beat_sync > 0.0:
+        bar_len = round(beat_sync * 5)
+        st.caption(f"🎵 Муз. совмест.: {'█' * bar_len}{'░' * (5 - bar_len)} {beat_sync:.2f}")
+    if scene.get('is_cross_duplicate'):
+        st.caption("⚠️ Дубликат из другого видео")
+    if scene.get('reason'):
+        st.caption(f"💡 {scene['reason']}")
+    if scene.get('warnings'):
+        st.caption(f"⚠️ {scene['warnings']}")
+    if is_rej:
+        st.caption("🚫 Исключено вами")
+
+    # Selection checkbox (disabled if rejected)
+    if not is_rej:
+        checked = st.checkbox("Включить в монтаж", value=is_sel, key=f"cb_{scene_key}")
+        if checked != is_sel:
+            cur = set(approved_ids) if approved_ids is not None else set()
+            if checked:
+                cur.update(fids)
+            else:
+                cur.difference_update(fids)
+            st.session_state.prep_approved_ids = cur
+            st.rerun()
+
+        # Exclude button
+        if st.button("🚫 Исключить", key=f"excl_{scene_key}", use_container_width=True):
+            rej = set(st.session_state.get('prep_rejected_fids', set()))
+            rej.update(fids)
+            st.session_state.prep_rejected_fids = rej
+            # Also remove from approved
+            cur = set(approved_ids) if approved_ids is not None else set()
+            cur.difference_update(fids)
+            st.session_state.prep_approved_ids = cur
+            st.rerun()
+    else:
+        # Restore button for rejected scenes
+        if st.button("↩ Восстановить", key=f"restore_{scene_key}", use_container_width=True):
+            rej = set(st.session_state.get('prep_rejected_fids', set()))
+            rej.difference_update(fids)
+            st.session_state.prep_rejected_fids = rej
+            st.rerun()
+
+    # Lazy video load button
+    src = scene.get('source_path', '')
+    has_clip = clip_path and Path(clip_path).exists()
+    if src and Path(src).exists() and not has_clip and not is_rej:
+        if st.button("▶ Загрузить видео", key=f"loadclip_{scene_key}", use_container_width=True):
+            from src.preprocessing.scene_clipper import get_or_create_scene_clip
+            new_clip = get_or_create_scene_clip(src, scene['start_s'], scene['end_s'])
+            if new_clip:
+                scene['clip_path'] = new_clip
+                for s in st.session_state.get('prep_video_frags', []):
+                    if (s.get('source_id') == scene['source_id']
+                            and abs(s.get('start_s', 0) - scene['start_s']) < 0.1):
+                        s['clip_path'] = new_clip
+                        break
+                st.rerun()
+            else:
+                st.error("Не удалось создать превью")
+
+
+def _show_video_fragments_grouped(scenes: list, approved_ids, rejected_fids=None):
+    """Step 2 video section: filter bar + quick actions + material meter + grouped cards."""
+    if rejected_fids is None:
+        rejected_fids = st.session_state.get('prep_rejected_fids', set())
+
+    if not scenes:
+        st.warning("Видеофрагменты не найдены. Попробуйте пересчитать анализ.")
+        return
+
+    # ── Counts ────────────────────────────────────────────────────────────────
+    n_total  = len(scenes)
+    n_best   = sum(1 for s in scenes if s.get('category') == 'best')
+    n_good   = sum(1 for s in scenes if s.get('category') == 'good')
+    n_backup = sum(1 for s in scenes if s.get('category') == 'backup')
+    n_sel    = sum(1 for s in scenes
+                   if _scene_is_selected(s, approved_ids)
+                   and not _scene_is_user_rejected(s, rejected_fids))
+    n_rej    = sum(1 for s in scenes if _scene_is_user_rejected(s, rejected_fids))
+    n_vids   = len({s['source_id'] for s in scenes})
+
+    st.caption(
+        f"📹 {n_vids} видео · {n_total} сцен · "
+        f"🏆 {n_best} лучших · ✅ {n_good} хороших · 🔄 {n_backup} запасных · "
+        f"выбрано: **{n_sel}** · исключено: {n_rej}"
+    )
+
+    # ── Material sufficiency meter ─────────────────────────────────────────────
+    _tgt     = float(st.session_state.get('target_duration') or 60)
+    need_safe = _tgt * 1.5   # comfortable surplus (1.5× safety for variety)
+    from src.preprocessing.fragment_scorer import check_material_sufficiency
+    suf      = check_material_sufficiency(scenes, _tgt, rejected_fids)
+    sel_dur  = suf['selected_dur']
+    bkup_dur = suf['backup_dur']
+    total_avail = sel_dur + bkup_dur
+
+    if sel_dur >= need_safe:
+        # Best+good alone cover 1.5× target — comfortable
+        st.success(
+            f"✅ Материала достаточно: {sel_dur:.0f}с лучших/хороших сцен при цели {_tgt:.0f}с",
+        )
+    elif total_avail >= _tgt:
+        # Need backup to cover bare target
+        st.warning(
+            f"⚠️ Лучших/хороших сцен {sel_dur:.0f}с при цели {_tgt:.0f}с — "
+            f"доступно ещё **{bkup_dur:.0f}с** в запасных фрагментах.",
+        )
+        if st.button("🔄 Добавить запасные фрагменты", key="add_backup_frags",
+                     use_container_width=False):
+            backup_fids = {
+                fid for s in scenes
+                if s.get('category') == 'backup'
+                and not _scene_is_user_rejected(s, rejected_fids)
+                for fid in s.get('fragment_ids', [])
+            }
+            cur = set(approved_ids) if approved_ids is not None else set()
+            cur.update(backup_fids)
+            st.session_state.prep_approved_ids = cur
+            st.rerun()
+    else:
+        # Even total is less than bare target duration — genuinely too little material
+        shortage = max(0.0, _tgt - total_avail)
+        st.error(
+            f"❌ Материала слишком мало: {total_avail:.0f}с из нужных {_tgt:.0f}с "
+            f"(не хватает ~{shortage:.0f}с). "
+            "Добавьте больше видео или уменьшите длительность ролика в настройках.",
+        )
+
+    # ── Filter tabs ────────────────────────────────────────────────────────────
+    filt = st.radio(
+        "Показать:",
+        options=['all', 'best', 'good', 'backup', 'selected', 'excluded'],
+        format_func=lambda x: {
+            'all':      f'📋 Все ({n_total})',
+            'best':     f'🏆 Лучшие ({n_best})',
+            'good':     f'✅ Хорошие ({n_good})',
+            'backup':   f'🔄 Запасные ({n_backup})',
+            'selected': f'☑ Выбранные ({n_sel})',
+            'excluded': f'🚫 Исключённые ({n_rej})',
+        }[x],
+        horizontal=True,
+        key='prep_vid_filter',
+        label_visibility='collapsed',
+    )
+
+    def _passes(s):
+        cat = s.get('category', 'good')
+        sel = _scene_is_selected(s, approved_ids)
+        rej = _scene_is_user_rejected(s, rejected_fids)
+        if filt == 'best':     return cat == 'best'
+        if filt == 'good':     return cat in ('best', 'good')
+        if filt == 'backup':   return cat == 'backup'
+        if filt == 'selected': return sel and not rej
+        if filt == 'excluded': return rej
+        return True   # 'all'
+
+    visible = [s for s in scenes if _passes(s)]
+
+    # ── Sort ──────────────────────────────────────────────────────────────────
+    has_beat = any(s.get('beat_sync_score', 0.0) > 0.0 for s in visible)
+    sort_options = ['quality', 'time']
+    if has_beat:
+        sort_options.append('music')
+    sort_opt = st.radio(
+        "Сортировка:",
+        options=sort_options,
+        format_func=lambda x: {
+            'quality': '🏆 По качеству',
+            'time':    '⏱ По времени',
+            'music':   '🎵 По музыке',
+        }[x],
+        horizontal=True,
+        key='prep_sort_opt',
+        label_visibility='collapsed',
+    )
+    if sort_opt == 'quality':
+        visible.sort(key=lambda s: s.get('ums_score') or s.get('quality_score') or 0.0, reverse=True)
+    elif sort_opt == 'time':
+        visible.sort(key=lambda s: (s.get('source_id', 0), s.get('start_s', 0.0)))
+    elif sort_opt == 'music':
+        visible.sort(key=lambda s: s.get('beat_sync_score') or 0.0, reverse=True)
+
+    # ── Quick actions ──────────────────────────────────────────────────────────
+    qa1, qa2, qa3, qa4 = st.columns(4)
+    with qa1:
+        if st.button("🏆 Только лучшие", key="prep_sel_best", use_container_width=True,
+                     help="Выбрать только сцены категории 'best'"):
+            ids = {fid for s in scenes if s.get('category') == 'best'
+                   and not _scene_is_user_rejected(s, rejected_fids)
+                   for fid in s.get('fragment_ids', [])}
+            st.session_state.prep_approved_ids = ids or {
+                fid for s in scenes if not _scene_is_user_rejected(s, rejected_fids)
+                for fid in s.get('fragment_ids', [])
+            }
+            st.rerun()
+    with qa2:
+        if st.button("✅ Лучшие + хорошие", key="prep_sel_good", use_container_width=True):
+            ids = {fid for s in scenes if s.get('category') in ('best', 'good')
+                   and not _scene_is_user_rejected(s, rejected_fids)
+                   for fid in s.get('fragment_ids', [])}
+            st.session_state.prep_approved_ids = ids or {
+                fid for s in scenes if not _scene_is_user_rejected(s, rejected_fids)
+                for fid in s.get('fragment_ids', [])
+            }
+            st.rerun()
+    with qa3:
+        if st.button("📋 Выбрать все", key="prep_sel_all", use_container_width=True):
+            ids = {fid for s in scenes
+                   if not _scene_is_user_rejected(s, rejected_fids)
+                   for fid in s.get('fragment_ids', [])}
+            st.session_state.prep_approved_ids = ids
+            st.rerun()
+    with qa4:
+        if st.button("🚫 Снять всё", key="prep_desel_all", use_container_width=True):
+            st.session_state.prep_approved_ids = set()
+            st.rerun()
+
+    if not visible:
+        st.caption("Нет сцен для выбранного фильтра.")
+        return
+
+    # ── Group by source video ──────────────────────────────────────────────────
+    by_video: dict = {}
+    for s in visible:
+        key = (s.get('source_id', 0), s.get('source_path', ''))
+        by_video.setdefault(key, []).append(s)
+
+    for (_, src_path), src_scenes in by_video.items():
+        fname       = Path(src_path).name if src_path else 'Неизвестный файл'
+        n_src_sel   = sum(1 for s in src_scenes
+                          if _scene_is_selected(s, approved_ids)
+                          and not _scene_is_user_rejected(s, rejected_fids))
+        n_src_tot   = len(src_scenes)
+        n_src_best  = sum(1 for s in src_scenes if s.get('category') == 'best')
+        n_src_good  = sum(1 for s in src_scenes if s.get('category') == 'good')
+        n_src_bkup  = sum(1 for s in src_scenes if s.get('category') == 'backup')
+
+        with st.expander(
+            f"📹 **{fname}**  —  {n_src_sel}/{n_src_tot} выбрано  "
+            f"·  🏆{n_src_best} ✅{n_src_good} 🔄{n_src_bkup}",
+            expanded=True,
+        ):
+            cols_per_row = 3
+            for row_i in range(0, len(src_scenes), cols_per_row):
+                row_scenes = src_scenes[row_i:row_i + cols_per_row]
+                row_cols = st.columns(cols_per_row)
+                for col, scene in zip(row_cols, row_scenes):
+                    sk = f"{scene.get('source_id',0)}_{int(scene.get('start_s',0)*100)}"
+                    with col:
+                        _show_scene_card(scene, approved_ids, sk, rejected_fids)
+
+
+def _show_music_fragments_with_audio(music_frags: list, music_path: str):
+    """Step 2 music section: cards with inline audio players."""
+    from src.preprocessing.music_fragment_analyzer import fragment_type_label, fragment_type_emoji
+
+    cur_range = st.session_state.get('prep_music_range')
+
+    # ── Mode selector ──────────────────────────────────────────────────────────
+    music_mode = st.radio(
+        "Использовать музыку:",
+        options=['auto', 'whole', 'manual'],
+        format_func=lambda x: {
+            'auto':   '🤖 Лучший участок',
+            'whole':  '🎵 Весь трек',
+            'manual': '✂️ Вручную',
+        }[x],
+        index=0 if cur_range is not None else 1,
+        horizontal=True,
+        key='prep_music_mode',
+    )
+
+    if music_mode == 'whole':
+        st.session_state.prep_music_range = None
+        cur_range = None
+
+    elif music_mode == 'auto':
+        best_mf = max(music_frags, key=lambda x: x.get('montage_score', 0))
+        st.session_state.prep_music_range = (best_mf['start_s'], best_mf['end_s'])
+        cur_range = st.session_state.prep_music_range
+
+    elif music_mode == 'manual':
+        _total_dur = music_frags[-1]['end_s'] if music_frags else 300.0
+        mc1, mc2 = st.columns(2)
+        _ms_def = cur_range[0] if cur_range else 0.0
+        _me_def = cur_range[1] if cur_range else min(_total_dur, 60.0)
+        with mc1:
+            _ms = st.number_input("Начало (с)", min_value=0.0, max_value=_total_dur,
+                                  value=_ms_def, step=1.0, key='prep_music_start_manual')
+        with mc2:
+            _me = st.number_input("Конец (с)", min_value=0.0, max_value=_total_dur,
+                                  value=_me_def, step=1.0, key='prep_music_end_manual')
+        if _me > _ms:
+            st.session_state.prep_music_range = (_ms, _me)
+            cur_range = (_ms, _me)
+        if cur_range:
+            manual_clip = _get_music_clip(music_path, cur_range[0], cur_range[1])
+            if manual_clip:
+                st.caption(f"Превью: {_fmt_ts(cur_range[0])} – {_fmt_ts(cur_range[1])}")
+                st.audio(manual_clip)
+            else:
+                st.caption("Аудио-превью недоступно для данного диапазона")
+
+    # ── Quick actions ──────────────────────────────────────────────────────────
+    mqa1, mqa2, mqa3, mqa4 = st.columns(4)
+    with mqa1:
+        if st.button("🏆 Лучший для монтажа", key="mqa_best", use_container_width=True):
+            best = max(music_frags, key=lambda x: x.get('montage_score', 0))
+            st.session_state.prep_music_range = (best['start_s'], best['end_s'])
+            st.rerun()
+    with mqa2:
+        if st.button("⚡ Самый энергичный", key="mqa_energy", use_container_width=True):
+            best = max(music_frags, key=lambda x: x.get('energy_score', 0))
+            st.session_state.prep_music_range = (best['start_s'], best['end_s'])
+            st.rerun()
+    with mqa3:
+        if st.button("🥁 Чёткий ритм", key="mqa_rhythm", use_container_width=True):
+            best = max(music_frags, key=lambda x: x.get('beat_clarity', 0))
+            st.session_state.prep_music_range = (best['start_s'], best['end_s'])
+            st.rerun()
+    with mqa4:
+        if st.button("🔄 Весь трек", key="mqa_whole", use_container_width=True):
+            st.session_state.prep_music_range = None
+            st.rerun()
+
+    st.write("")  # spacer
+
+    # ── Fragment cards with audio players ──────────────────────────────────────
+    for _mfi, mf in enumerate(music_frags):
+        ftype   = mf.get('fragment_type', 'calm')
+        emoji   = fragment_type_emoji(ftype)
+        label   = fragment_type_label(ftype)
+        start   = mf['start_s']
+        end     = mf['end_s']
+        dur     = mf['duration_s']
+        energy  = mf.get('energy_score', 0)
+        rhythm  = mf.get('rhythm_score', 0)
+        beat_cl = mf.get('beat_clarity', 0)
+        score   = mf.get('montage_score', 0)
+        reason  = mf.get('reason', '')
+        status  = mf.get('status', 'recommended')
+        mfid    = mf.get('id') or _mfi
+
+        is_cur = (cur_range is not None
+                  and abs(cur_range[0] - start) < 0.5
+                  and abs(cur_range[1] - end) < 0.5)
+
+        border_color = '#4f8ef7' if is_cur else '#2d3148'
+        status_badge = {'best': '🏆 Лучший', 'recommended': '✅ Рекомендован'}.get(status, '')
+        energy_bar   = '▪' * int(energy * 10) + '░' * (10 - int(energy * 10))
+
+        st.markdown(
+            f"<div style='border:1px solid {border_color};border-radius:8px;"
+            f"padding:10px 14px;margin-bottom:4px;background:#12141f'>"
+            f"<b>{emoji} {label}</b>&nbsp;&nbsp;"
+            f"<code>{_fmt_ts(start)} – {_fmt_ts(end)}</code>&nbsp; ({dur:.0f}с) &nbsp;{status_badge}<br>"
+            f"<small>Энергия: {energy_bar}&nbsp; Ритм: {rhythm:.2f}&nbsp;"
+            f"Чёткость: {beat_cl:.2f}&nbsp; Монтаж: {score:.2f}</small>"
+            + (f"<br><small style='color:#aaa'>💡 {reason}</small>" if reason else "")
+            + (f"<br><small style='color:#f0a'>⚠ {mf.get('warnings')}</small>"
+               if mf.get('warnings') else "")
+            + "</div>",
+            unsafe_allow_html=True,
+        )
+
+        # ── Audio player ───────────────────────────────────────────────────────
+        audio_clip = mf.get('audio_clip_path')
+        if audio_clip and Path(audio_clip).exists():
+            st.audio(audio_clip)
+        else:
+            # Try on-demand extraction
+            on_demand = _get_music_clip(music_path, start, end)
+            if on_demand:
+                mf['audio_clip_path'] = on_demand
+                st.audio(on_demand)
+            else:
+                col_err, col_retry = st.columns([3, 1])
+                with col_err:
+                    st.caption("🎵 Аудио-превью недоступно")
+                with col_retry:
+                    if st.button("↺", key=f"mf_retry_{_mfi}", help="Попробовать снова"):
+                        retry_clip = _get_music_clip(music_path, start, end)
+                        if retry_clip:
+                            mf['audio_clip_path'] = retry_clip
+                            st.rerun()
+
+        # ── Actions ────────────────────────────────────────────────────────────
+        mfc1, mfc2 = st.columns([3, 1])
+        with mfc1:
+            if st.button(
+                "✅ Использовать этот участок",
+                key=f"mf_sel_{_mfi}",
+                use_container_width=True,
+                type="primary" if is_cur else "secondary",
+            ):
+                st.session_state.prep_music_range = (start, end)
+                st.rerun()
+        with mfc2:
+            if st.button("🚫 Исключить", key=f"mf_excl_{_mfi}", use_container_width=True):
+                video_paths = st.session_state.get('selected_videos') or []
+                _vid_dirs = list({str(Path(vp).parent) for vp in video_paths})
+                for _vd in _vid_dirs:
+                    try:
+                        from src.storage.analysis_db import AnalysisDB as _ADB2
+                        _db2 = _ADB2(_vd)
+                        _db2.update_music_fragment_user_selection(mfid, False, excluded_by_user=True)
+                    except Exception:
+                        pass
+                st.session_state.prep_music_frags = [
+                    m for m in music_frags if m.get('id') != mfid
+                ]
+                st.rerun()
+
+    # ── Mismatch warnings ─────────────────────────────────────────────────────
+    _mrange = st.session_state.get('prep_music_range')
+    _tgt = st.session_state.get('target_duration') or 60
+    if _mrange and _tgt:
+        _music_dur = _mrange[1] - _mrange[0]
+        if _music_dur < _tgt * 0.8:
+            st.warning(
+                f"⚠️ Выбранный музыкальный участок ({_music_dur:.0f}с) короче "
+                f"длительности ролика ({_tgt:.0f}с). Участок будет зациклен."
+            )
+
+
+def _show_music_range_simple(music_path: str) -> None:
+    """Simple music start/end time picker — no auto-analysis required."""
+    try:
+        st.audio(music_path)
+    except Exception:
+        st.caption(f"Файл: {Path(music_path).name}")
+    cur_range = st.session_state.get('prep_music_range')
+    mc1, mc2 = st.columns(2)
+    with mc1:
+        _ms = st.number_input("Начало (с)", min_value=0.0,
+                              value=float(cur_range[0]) if cur_range else 0.0,
+                              step=1.0, key='prep_music_start_simple')
+    with mc2:
+        _me = st.number_input("Конец (с)", min_value=0.0,
+                              value=float(cur_range[1]) if cur_range else 60.0,
+                              step=1.0, key='prep_music_end_simple')
+    if _me > _ms:
+        st.session_state.prep_music_range = (_ms, _me)
+        st.caption(f"Выбранный участок: {_ms:.0f}с – {_me:.0f}с ({_me - _ms:.0f}с)")
+    else:
+        st.session_state.prep_music_range = None
+
+
+def _show_step2_auto_tab(prep_mode, project_dir: str, music_path) -> None:
+    """Auto-analysis content for the secondary 'Авто-анализ' tab in Step 2."""
+    video_frags: list = st.session_state.get('prep_video_frags', [])
+
+    if prep_mode not in ('done',):
+        st.info(
+            "Система автоматически найдёт хорошие фрагменты в ваших видео. "
+            "Это займёт несколько минут."
+        )
+        a1, a2 = st.columns(2)
+        with a1:
+            if st.button("⚡ Авто (применить сразу)", key="s2auto_run_confirm",
+                         type="primary", use_container_width=True):
+                st.session_state.prep_mode = 'running'
+                st.session_state._prep_auto_confirm = True
+                st.rerun()
+        with a2:
+            if st.button("🔍 Авто + ревью", key="s2auto_run_review",
+                         use_container_width=True):
+                st.session_state.prep_mode = 'running'
+                st.session_state._prep_auto_confirm = False
+                st.rerun()
+        return
+
+    # prep_mode == 'done' — show fragment review
+    music_frags: list = st.session_state.get('prep_music_frags', [])
+    _approved_ids  = st.session_state.get('prep_approved_ids')
+
+    # Auto-confirm on first entry if requested
+    if st.session_state.get('_prep_auto_confirm') and _approved_ids is None:
+        good_ids = {fid for s in video_frags
+                    if s.get('category', 'good') in ('best', 'good')
+                    for fid in s.get('fragment_ids', [])}
+        if not good_ids:
+            good_ids = {fid for s in video_frags
+                        if s.get('category') == 'backup'
+                        for fid in s.get('fragment_ids', [])}
+        st.session_state.prep_approved_ids = good_ids or {
+            fid for s in video_frags for fid in s.get('fragment_ids', [])
+        }
+        if music_frags:
+            best_mf = max(music_frags, key=lambda x: x.get('montage_score', 0))
+            st.session_state.prep_music_range = (best_mf['start_s'], best_mf['end_s'])
+        st.session_state._prep_auto_confirm = False
+        st.rerun()
+
+    _approved_ids  = st.session_state.get('prep_approved_ids')
+    _rejected_fids = st.session_state.get('prep_rejected_fids', set())
+
+    st.write("**🎥 Найденные видеофрагменты:**")
+    _show_video_fragments_grouped(video_frags, _approved_ids, _rejected_fids)
+
+    if music_path and music_frags:
+        st.write("---")
+        _show_music_fragments_with_audio(music_frags, music_path)
+
+    if st.button("🔄 Пересчитать анализ", key="s2auto_recalc", use_container_width=True):
+        st.session_state.prep_mode = 'running'
+        st.session_state._prep_force_reanalyze = True
+        st.session_state.prep_video_frags = []
+        st.session_state.prep_music_frags = []
+        st.rerun()
+
+    # Material sufficiency warning
+    _tgt = float(st.session_state.get('target_duration') or 60)
+    _mrange = st.session_state.get('prep_music_range')
+    if _mrange and _tgt:
+        _music_dur = _mrange[1] - _mrange[0]
+        if _music_dur < _tgt * 0.8:
+            st.warning(
+                f"Выбранный музыкальный участок ({_music_dur:.0f}с) короче "
+                f"длительности ролика ({_tgt:.0f}с). Участок будет зациклен."
+            )
+
+
+def _show_wizard_step2():
+    """Step 2: Manual video markup — primary. Auto-analysis is a secondary tab."""
+    video_paths = st.session_state.get('selected_videos') or []
+    project_dir = str(Path(video_paths[0]).parent) if video_paths else ''
+    music_path: Optional[str] = (
+        st.session_state.get('selected_audio') or st.session_state.get('music_path')
+    )
+    prep_mode = st.session_state.get('prep_mode')
+
+    if not video_paths:
+        st.warning("Не выбраны видеофайлы. Вернитесь на шаг 1.")
+        if st.button("← Назад на шаг 1", key="step2_back_novideos"):
+            st.session_state.wizard_step = 1
+            st.rerun()
+        return
+
+    # Auto-analysis is running (triggered from the secondary tab)
+    if prep_mode == 'running':
+        _force = bool(st.session_state.pop('_prep_force_reanalyze', False))
+        with st.spinner("Анализирую видеофайлы… Это может занять несколько минут."):
+            _run_prep_analysis(project_dir, music_path, force=_force)
+        st.session_state.prep_mode = 'done'
+        # Switch to auto tab so user sees the results
+        st.session_state._s2_display_mode = 'auto'
+        st.rerun()
+        return
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    st.markdown("## Разметка видеоматериалов")
+    st.caption(
+        "Просмотрите исходные видео, выделите нужные участки "
+        "и укажите их роли в будущем монтаже."
+    )
+
+    # ── Mode selector tabs ────────────────────────────────────────────────────
+    cur = st.session_state.get('_s2_display_mode', 'manual')
+    mt1, mt2, mt3 = st.columns(3)
+    with mt1:
+        _active = cur == 'manual'
+        if st.button(
+            "✏️ Разметка вручную" + (" ✓" if _active else ""),
+            key="s2_tab_manual", use_container_width=True,
+            type="primary" if _active else "secondary",
+        ):
+            st.session_state._s2_display_mode = 'manual'
+            st.rerun()
+    with mt2:
+        _active = cur == 'auto'
+        if st.button(
+            "⚡ Авто-анализ" + (" ✓" if _active else ""),
+            key="s2_tab_auto", use_container_width=True,
+            type="primary" if _active else "secondary",
+        ):
+            st.session_state._s2_display_mode = 'auto'
+            st.rerun()
+    with mt3:
+        if st.button("⏭ Пропустить", key="s2_tab_skip", use_container_width=True,
+                     help="Пропустить разметку — сервис будет работать по стандартной логике"):
+            st.session_state.prep_mode = 'skipped'
+            st.session_state.prep_approved_ids = None
+            st.session_state.prep_music_range = None
+            st.session_state.wizard_step = 3
+            st.rerun()
+
+    st.write("---")
+
+    # ── Manual markup tab (DEFAULT) ───────────────────────────────────────────
+    if cur == 'manual':
+        _show_manual_markup_ui(video_paths, project_dir)
+        if music_path:
+            with st.expander("🎵 Настройка музыки", expanded=False):
+                _show_music_range_simple(music_path)
+
+    # ── Auto-analysis tab ─────────────────────────────────────────────────────
+    elif cur == 'auto':
+        _show_step2_auto_tab(prep_mode, project_dir, music_path)
+
+    # ── Navigation bar ─────────────────────────────────────────────────────────
+    st.write("---")
+    nav1, nav2, nav3 = st.columns([1, 2, 1])
+    with nav1:
+        if st.button("← Назад", key="step2_back", use_container_width=True):
+            st.session_state.wizard_step = 1
+            st.rerun()
+    with nav2:
+        # Reset button only visible in auto tab when analysis is done
+        if cur == 'auto' and prep_mode == 'done':
+            if st.button("↩ Сбросить авто-анализ", key="step2_reset_auto",
+                         use_container_width=True):
+                for _k, _v in [
+                    ('prep_mode', None), ('prep_approved_ids', None),
+                    ('prep_music_range', None), ('prep_video_frags', []),
+                    ('prep_music_frags', []), ('prep_rejected_fids', set()),
+                    ('prep_calibration', {}), ('prep_diagnostic', {}),
+                ]:
+                    st.session_state[_k] = _v
+                st.rerun()
+    with nav3:
+        # Build "Далее" label based on current mode
+        if cur == 'manual':
+            try:
+                from src.preprocessing.manual_segments import ManualSegmentsStore as _MSS2
+                _n_segs = len(_MSS2(project_dir).get_all())
+            except Exception:
+                _n_segs = 0
+            _next_lbl = (
+                f"Далее → ({_n_segs} фрагм.)" if _n_segs > 0
+                else "Далее без разметки →"
+            )
+        elif prep_mode == 'done':
+            _scenes_n = st.session_state.get('prep_video_frags', [])
+            _aids_n   = st.session_state.get('prep_approved_ids')
+            _nc = sum(1 for s in _scenes_n if _scene_is_selected(s, _aids_n))
+            _next_lbl = f"Далее → ({_nc} сцен)" if _nc > 0 else "Далее →"
+        else:
+            _next_lbl = "Далее →"
+
+        if st.button(_next_lbl, key="step2_next", use_container_width=True, type="primary"):
+            if cur == 'manual':
+                try:
+                    from src.preprocessing.manual_segments import ManualSegmentsStore as _MSS3
+                    _ns = len(_MSS3(project_dir).get_all())
+                    if _ns > 0:
+                        st.session_state.prep_mode = 'manual'
+                        st.session_state.prep_manual_confirmed = True
+                    else:
+                        # No manual segments → treat as skipped
+                        st.session_state.prep_mode = 'skipped'
+                        st.session_state.prep_approved_ids = None
+                        st.session_state.prep_music_range = None
+                except Exception:
+                    st.session_state.prep_mode = 'skipped'
+            else:
+                # Auto tab
+                if prep_mode is None:
+                    st.session_state.prep_mode = 'skipped'
+                    st.session_state.prep_approved_ids = None
+                    st.session_state.prep_music_range = None
+                elif prep_mode == 'done' and st.session_state.get('prep_approved_ids') is None:
+                    _sn = st.session_state.get('prep_video_frags', [])
+                    st.session_state.prep_approved_ids = {
+                        fid for s in _sn for fid in s.get('fragment_ids', [])
+                    }
+            st.session_state.wizard_step = 3
+            st.rerun()
+
+
+def _show_wizard_step3():
+    """Step 3: Montage settings (platform / format / duration / style) + generate."""
+    st.markdown("### Шаг 3: Настройки монтажа")
+
+    s3_settings, s3_style = st.columns([3, 4], gap="medium")
+
+    with s3_settings:
         st.write("**📲 Платформа**")
         show_platform_section()
 
@@ -2031,19 +3903,17 @@ def show_welcome_screen():
         _fmt_locked   = _plat_cfg['locks_format']
         _dur_locked   = _plat_cfg['locks_duration']
 
-        # ── Format ───────────────────────────────────────────────────────────
         st.write("**📐 Формат**")
         if _fmt_locked:
             locked_fmt = _plat_cfg['format']
             st.info(f"🔒 {_FMT_LABELS.get(locked_fmt, locked_fmt)}", icon="🔒")
             st.session_state.selected_output_format = locked_fmt
-            sel_fmt = locked_fmt
         else:
             fmt_opts = {
                 "horizontal_16_9": "16:9 Horizontal",
-                "vertical_9_16": "9:16 Vertical",
-                "square_1_1": "1:1 Square",
-                "original": "Оригинал",
+                "vertical_9_16":   "9:16 Vertical",
+                "square_1_1":      "1:1 Square",
+                "original":        "Оригинал",
             }
             _cur_fmt = st.session_state.get('selected_output_format', 'horizontal_16_9')
             _fmt_idx = list(fmt_opts.keys()).index(_cur_fmt) if _cur_fmt in fmt_opts else 0
@@ -2058,7 +3928,6 @@ def show_welcome_screen():
             )
             st.session_state.selected_output_format = sel_fmt
 
-        # Vertical mode (compact, only for 9:16)
         if st.session_state.get('selected_output_format') == "vertical_9_16":
             _vert_opts = {
                 "center_crop": "✂️ По центру",
@@ -2076,7 +3945,6 @@ def show_welcome_screen():
             )
             st.session_state.vertical_mode = sel_vert
 
-        # ── Duration ─────────────────────────────────────────────────────────
         st.write("**⏱ Длительность**")
         if _dur_locked:
             locked_dur = _plat_cfg['duration_seconds']
@@ -2086,10 +3954,10 @@ def show_welcome_screen():
             st.session_state.target_duration = float(locked_dur)
         else:
             dc = st.columns(4)
-            for di, (secs, label) in enumerate([(15, "15с"), (30, "30с"), (60, "1м"), (90, "90с")]):
+            for di, (secs, dlabel) in enumerate([(15, "15с"), (30, "30с"), (60, "1м"), (90, "90с")]):
                 with dc[di]:
                     is_sel = st.session_state.get('target_duration') == secs
-                    if st.button(label, key=f"dur_{secs}", use_container_width=True,
+                    if st.button(dlabel, key=f"dur_{secs}", use_container_width=True,
                                  type="secondary" if is_sel else "primary"):
                         st.session_state.target_duration = secs
                         st.session_state.manual_duration = secs
@@ -2115,30 +3983,29 @@ def show_welcome_screen():
                 dm2, ds2 = int(d) // 60, int(d) % 60
                 st.caption(f"✓ {dm2}м {ds2}с" if dm2 else f"✓ {d:.0f}с")
 
-    with right_col:
-        # ── Style selector (compact 2-column grid) ───────────────────────────
+    with s3_style:
         st.write("**🎨 Стиль монтажа**")
         registry    = st.session_state.preset_registry
         presets     = registry.list_presets()
         current_pid = st.session_state.get('selected_preset_id')
-
         _show_compact_style_grid(
             presets + [{'preset_id': 'manual', 'emoji': '⚙️',
                         'name': 'Manual', 'description': 'Ручные настройки'}],
             current_pid or '',
         )
 
-    # ── Optional expanders (quality analysis, preprocessing, branding) ──────
+    # Optional expanders
     if st.session_state.selected_videos:
         show_quality_analysis_section(st.session_state.selected_videos)
+        show_render_history_section(st.session_state.selected_videos)
         show_preprocess_section(st.session_state.selected_videos)
     show_branding_section()
 
-    # ── Bottom generate bar (only when preset is selected) ────────────────────
+    # Generate bar (only when preset selected)
     _pid = st.session_state.get('selected_preset_id')
     if _pid and _pid != "manual":
+        registry = st.session_state.preset_registry
 
-        # Style-specific settings (compact expander)
         if _pid == 'easy_mode':
             with st.expander("⚡ Easy настройки", expanded=False):
                 ea1, ea2 = st.columns(2)
@@ -2170,10 +4037,11 @@ def show_welcome_screen():
                     st.checkbox("Sync с битом", value=True, key="sport_beat_sync")
         else:
             preset_chk = registry.get_preset(_pid)
-            if preset_chk and preset_chk.settings.music_sync.enabled and not st.session_state.selected_audio:
+            if (preset_chk
+                    and preset_chk.settings.music_sync.enabled
+                    and not st.session_state.selected_audio):
                 st.caption("⚠️ Стиль использует синхронизацию с музыкой — добавьте аудио")
 
-        # Advanced + sound in one row of expanders
         adv_col, _ = st.columns([3, 1])
         with adv_col:
             with st.expander("⚙️ Дополнительно", expanded=False):
@@ -2208,8 +4076,12 @@ def show_welcome_screen():
                     except Exception:
                         pass
 
-        # ── Generate button bar ────────────────────────────────────────────────
-        gen_a, gen_b, gen_c = st.columns([2, 3, 1], gap="small")
+        gen_back, gen_a, gen_b, gen_c = st.columns([1, 2, 3, 1], gap="small")
+
+        with gen_back:
+            if st.button("← Назад", key="step3_back", use_container_width=True):
+                st.session_state.wizard_step = 2
+                st.rerun()
 
         with gen_a:
             _pcount = st.radio(
@@ -2258,7 +4130,7 @@ def show_welcome_screen():
                 st.session_state.variants = {}
                 st.session_state.active_variant_id = None
                 st.session_state.previews_stale = False
-                st.session_state._sound_played_key = None  # reset for new job
+                st.session_state._sound_played_key = None
                 st.rerun()
 
         with gen_c:
@@ -2270,6 +4142,32 @@ def show_welcome_screen():
                 st.session_state.selected_videos = []
                 st.session_state.selected_audio = None
                 st.rerun()
+
+    else:
+        st.divider()
+        back_col, _ = st.columns([1, 3])
+        with back_col:
+            if st.button("← Назад", key="step3_back_nopid", use_container_width=True):
+                st.session_state.wizard_step = 2
+                st.rerun()
+        st.caption("⚠️ Выберите стиль монтажа для генерации")
+
+
+def show_welcome_screen():
+    """4-step wizard: materials → preparation → settings → generate."""
+    current_step = st.session_state.get('wizard_step', 1)
+    _show_step_indicator(current_step)
+    st.divider()
+
+    if current_step == 1:
+        _show_wizard_step1()
+    elif current_step == 2:
+        _show_wizard_step2()
+    elif current_step == 3:
+        _show_wizard_step3()
+    else:
+        st.session_state.wizard_step = 1
+        st.rerun()
 
 
 
@@ -4321,6 +6219,18 @@ def render_video():
                     add_render_log(f"AudioEngine failed: {e} — from start", 'WARNING')
                     audio_selection = None
 
+            # ── Preprocessing: override music range if user selected one ──────
+            _prep_music_range = st.session_state.get('prep_music_range')
+            if _prep_music_range and st.session_state.get('prep_mode') == 'done':
+                _pms, _pme = _prep_music_range
+                class _PrepAudioSel:
+                    start_time = _pms
+                    end_time   = _pme
+                    score      = 1.0
+                    loop_required = False
+                audio_selection = _PrepAudioSel()
+                add_render_log(f"[Preprocessing] Музыкальный диапазон: {_pms:.1f}s–{_pme:.1f}s")
+
             # Clip selection (skipped when approved_segments provided from draft)
             set_render_progress(50, "Выбор видеофрагментов")
             preset_id = st.session_state.get('selected_preset_id', 'manual')
@@ -4416,7 +6326,7 @@ def render_video():
                     'travel_story', 'real_estate_property_tour', 'event_highlights',
                     'calm_minimal_documentary', 'intelligent_beauty_mix',
                     'sport_dynamic_cut', 'sport_highlight_impact',
-                    'f1',
+                    'f1', 'f2', 'f3', 'f4', 'f5', 'f6',
                 ]
                 if use_new_system:
                     add_render_log(f"Стратегический выбор клипов: {preset_id}")
@@ -4451,7 +6361,17 @@ def render_video():
                         f" scores={[round(getattr(c,'final_score',0),3) for c in _all_candidates[:5]]}"
                     )
 
-                    # ── Merge preprocessing cache candidates (if available) ───
+                    # ── Step 2 → Step 3: load DB candidates + build forbidden-range index ──
+                    _prep_rejected_fids = st.session_state.get('prep_rejected_fids', set())
+                    _prep_approved_ids  = st.session_state.get('prep_approved_ids')
+                    _prep_active = (
+                        st.session_state.get('prep_mode') == 'done' or
+                        (st.session_state.get('prep_mode') == 'manual' and
+                         st.session_state.get('prep_manual_confirmed', False))
+                    )
+                    _priority_ranges: list = []  # (source_path, start_s, end_s) manual required ranges
+                    _forbidden_ranges: list = []   # (source_path, start_s, end_s) for range filter
+
                     try:
                         _video_dirs = list({str(Path(s['path']).parent) for s in sources})
                         for _vdir in _video_dirs:
@@ -4462,21 +6382,82 @@ def render_video():
                             if _pstats['analyzed_files'] > 0:
                                 _style_key = f'{preset_id}_score' if preset_id else 'quality_score'
                                 _lib = _FL(_pdb)
+                                _allowed = _prep_approved_ids if _prep_active else None
                                 _pp_cands = _lib.get_all_candidates_for_project(
                                     style_score_key=_style_key,
                                     min_quality=0.50,
                                     min_duration=float(getattr(st.session_state, 'min_clip_duration', 1.0) or 1.0),
                                     max_duration=float(getattr(st.session_state, 'max_clip_duration', 10.0) or 10.0),
                                     limit=300,
+                                    allowed_fragment_ids=_allowed,
                                 )
                                 if _pp_cands:
                                     _all_candidates.extend(_pp_cands)
                                     add_render_log(
                                         f'[Preprocessing] +{len(_pp_cands)} кандидатов из кэша '
-                                        f'({_vdir}), всего: {len(_all_candidates)}'
+                                        f'({_vdir}){" [фильтр активен]" if _prep_active else ""}'
+                                        f', всего: {len(_all_candidates)}'
                                     )
+                                # Build forbidden time-range index for SegmentSelector candidates
+                                if _prep_active and _prep_rejected_fids:
+                                    try:
+                                        _rej_rows = _pdb.get_fragments_by_ids(_prep_rejected_fids)
+                                        for _rrow in _rej_rows:
+                                            _forbidden_ranges.append(
+                                                (str(_rrow['source_path']),
+                                                 float(_rrow['start_s']),
+                                                 float(_rrow['end_s']))
+                                            )
+                                    except Exception:
+                                        pass
                     except Exception as _pp_err:
                         add_render_log(f'[Preprocessing] Кэш недоступен: {_pp_err}', 'DEBUG')
+
+                    # Load manual segment ranges (forbidden + required) when in manual mode
+                    if (st.session_state.get('prep_mode') == 'manual' and
+                            st.session_state.get('prep_manual_confirmed', False)):
+                        try:
+                            from src.preprocessing.manual_segments import ManualSegmentsStore as _MSS
+                            for _vdir in (_video_dirs if '_video_dirs' in dir() else []):
+                                _ms_store = _MSS(_vdir)
+                                for _ms_frng in _ms_store.get_forbidden_ranges():
+                                    _forbidden_ranges.append(_ms_frng)
+                                for _ms_rrng in _ms_store.get_required_ranges():
+                                    _priority_ranges.append(_ms_rrng)
+                        except Exception as _ms_err:
+                            add_render_log(f'[ManualMarkup] {_ms_err}', 'DEBUG')
+
+                    # Apply MontagePool: remove forbidden + boost approved across ALL candidates
+                    if _prep_active and (_prep_rejected_fids or _prep_approved_ids):
+                        try:
+                            from src.preprocessing.step2_adapter import MontagePool as _MP
+                            from src.preprocessing.candidate_filter import apply_montage_pool as _amp
+                            _pool = _MP(
+                                forbidden_fragment_ids=set(_prep_rejected_fids or set()),
+                                forbidden_ranges=_forbidden_ranges,
+                                priority_fragment_ids=set(_prep_approved_ids or set()),
+                                priority_ranges=_priority_ranges,
+                                score_boost=0.30,
+                                is_active=True,
+                            )
+                            _n_before = len(_all_candidates)
+                            _all_candidates = _amp(_all_candidates, _pool)
+                            _n_removed = _n_before - len(_all_candidates)
+                            if _n_removed:
+                                add_render_log(
+                                    f'[Preprocessing] Отфильтровано {_n_removed} '
+                                    f'запрещённых фрагментов из {_n_before}'
+                                )
+                        except Exception as _flt_err:
+                            add_render_log(f'[Preprocessing] Фильтр не применён: {_flt_err}', 'WARNING')
+
+                    # Material sufficiency check — warn if approved-only pool is exhausted
+                    if _prep_active and _prep_approved_ids is not None and not _all_candidates:
+                        add_render_log(
+                            '[Preprocessing] После фильтра нет кандидатов — используем все',
+                            'WARNING'
+                        )
+                        st.session_state.prep_approved_ids = None
 
                     # ── Build structural variant constraints ──────────────────
                     _vconstraints = None
@@ -4558,6 +6539,30 @@ def render_video():
                             add_render_log(f"[Outro] {_tl_result.outro_log}")
                             add_render_log(f"[Audio] {_tl_result.audio_log}")
                             add_render_log(f"[Нарратив] {_tl_result.narrative}")
+
+                            # Clip selection explanation (Idea 2)
+                            for _seg in all_segments[:8]:
+                                try:
+                                    _role = getattr(_seg, 'role', 'body')
+                                    _fname = Path(_seg.source_path).name if hasattr(_seg, 'source_path') else '?'
+                                    _start = getattr(_seg, 'start', 0)
+                                    _feats = getattr(getattr(_seg, '_candidate', _seg), 'features', None)
+                                    _extra = ''
+                                    if _feats:
+                                        _q  = getattr(_feats, 'technical_quality_score', None)
+                                        _st = getattr(_feats, 'camera_stability_score', None)
+                                        _mo = getattr(_feats, 'motion_score', None)
+                                        if _q is not None:
+                                            _extra = f'q={_q:.2f}'
+                                        if _st is not None and _st > 0.7:
+                                            _extra += f'  stab={_st:.2f}'
+                                        if _mo is not None and _mo > 0.4:
+                                            _extra += f'  motion={_mo:.2f}'
+                                    add_render_log(
+                                        f'  [{_role.upper()}] {_fname} @{_start:.1f}s  {_extra}'
+                                    )
+                                except Exception:
+                                    pass
 
                             # ── F1: prepend split-screen intro + rapid cuts ───
                             if preset_id == 'f1' and _all_candidates:
@@ -5195,6 +7200,36 @@ def render_video():
 
             if st.session_state.get('generation_status') == 'rendering':
                 st.session_state.generation_status = 'completed'
+                # Save to render history (Idea 4)
+                try:
+                    from src.storage.analysis_db import AnalysisDB as _ADB
+                    _pvids = st.session_state.get('selected_videos', [])
+                    _pdir = _get_project_dir_from_videos(_pvids)
+                    if _pdir:
+                        _rdb = _ADB(_pdir)
+                        _pid = st.session_state.get('selected_preset_id', '')
+                        _pname = ''
+                        try:
+                            _reg = st.session_state.get('preset_registry')
+                            if _reg:
+                                _pp = _reg.get_preset(_pid)
+                                _pname = _pp.get('name', '') if _pp else ''
+                        except Exception:
+                            pass
+                        _segs = st.session_state.get('approved_segments') or \
+                                st.session_state.get('draft_segments', [])
+                        _dur = sum(getattr(s, 'duration', 0) for s in _segs)
+                        _rdb.save_render(
+                            project_dir=_pdir,
+                            style_id=_pid,
+                            style_name=_pname,
+                            music_path=st.session_state.get('selected_audio'),
+                            output_path=str(output_path) if output_path.exists() else None,
+                            clip_count=len(_segs),
+                            duration_s=_dur or None,
+                        )
+                except Exception as _rh_err:
+                    add_render_log(f"История рендеров: {_rh_err}", 'WARNING')
 
     except Exception as e:
         add_render_log(f"Ошибка сборки: {e}", 'ERROR')

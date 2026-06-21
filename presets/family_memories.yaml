@@ -1,0 +1,59 @@
+preset_id: family_memories
+name: Family Memories
+emoji: "👨‍👩‍👧"
+description: Тёплые, мягкие семейные воспоминания. Лица, дети, события.
+recommended_for: [семья, дети, праздник, день рождения, событие, family]
+dynamic_level: slow
+
+clip_selection:
+  segment_min_duration: 2.5
+  segment_max_duration: 7.0
+  prefer_faces: true
+  prefer_stable: true
+  prefer_warm_tones: true
+  min_quality_score: 0.40     # lower threshold — family content may not be perfect
+
+transitions:
+  type: crossfade
+  duration: 0.6
+  randomize: false
+
+speed_effects:
+  enabled: false
+
+color:
+  style: warm
+  saturation_boost: 0.05
+  warmth: 0.15
+  vignette: 0.10
+
+music_sync:
+  mode: dynamic_sync
+  cut_on_beat: false
+  prefer_calm_sections: true
+
+scoring_weights:
+  sharpness: 0.7            # family footage is often imperfect
+  stability: 0.8
+  brightness: 1.0
+  colorfulness: 0.7
+  motion: 0.4
+  face_presence: 2.0        # faces strongly preferred
+  face_size_bonus: 1.5      # close-up faces even better
+  aesthetic_score: 0.7
+
+segment_selection:
+  preferred_scene_categories: [people, face_closeup, indoor, outdoor, children]
+  preferred_camera_motion: [static, dolly, pan_left, pan_right, handheld]
+  rejected_camera_motion: [landing, takeoff, shake]
+  min_scores:
+    quality_score: 0.35
+    eyes_open_score: 0.50
+  role_rules:
+    intro:
+      preferred_tags: [people, face_closeup, outdoor, establishing_shot]
+      duration_sec: {min: 2, max: 6}
+    main_part:
+      preferred_tags: [people, face_closeup, indoor, activity]
+    ending:
+      preferred_tags: [people, smile, outdoor]

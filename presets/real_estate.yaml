@@ -1,0 +1,62 @@
+preset_id: real_estate
+name: Real Estate
+emoji: "🏠"
+description: Профессиональный монтаж для недвижимости — квартиры, дома, офисы, коммерческие помещения.
+recommended_for: [недвижимость, квартира, дом, офис, интерьер, экстерьер, риэлтор, real_estate]
+dynamic_level: slow
+
+clip_selection:
+  segment_min_duration: 3.5
+  segment_max_duration: 9.0
+  prefer_wide_shots: true
+  prefer_stable: true
+  prefer_detail_shots: true
+  min_quality_score: 0.55
+
+transitions:
+  type: crossfade
+  duration: 0.5
+  randomize: false
+
+speed_effects:
+  enabled: false
+
+color:
+  style: natural_warm
+  saturation_boost: 0.08
+  contrast_boost: 0.12
+  warmth: 0.10
+  vignette: 0.05
+
+music_sync:
+  mode: dynamic_sync
+  cut_on_beat: false
+  prefer_calm_sections: true
+
+scoring_weights:
+  sharpness: 1.6            # crisp detail shots are essential
+  stability: 1.5            # no handheld tolerated
+  brightness: 1.2
+  colorfulness: 0.8
+  motion: 0.2               # very calm shots preferred
+  face_presence: 0.4        # people optional in real estate
+  aesthetic_score: 1.7
+  composition_bonus: 1.4
+
+segment_selection:
+  preferred_scene_categories: [interior, exterior, architecture, wide_shot, detail_shot, urban, outdoor]
+  preferred_camera_motion: [static, dolly, pan_left, pan_right, tilt_up, tilt_down, reveal]
+  rejected_camera_motion: [shake, handheld, landing, takeoff, chaotic, zoom_in]
+  min_scores:
+    quality_score: 0.55
+    stability: 0.60
+    aesthetic_score: 0.45
+    composition_score: 0.45
+  role_rules:
+    intro:
+      preferred_tags: [exterior, facade, wide_shot, establishing_shot, aerial]
+      duration_sec: {min: 4, max: 9}
+    main_part:
+      preferred_tags: [interior, detail_shot, kitchen, bedroom, bathroom, living_room, office]
+    ending:
+      preferred_tags: [exterior, facade, wide_shot, aerial, sunset]

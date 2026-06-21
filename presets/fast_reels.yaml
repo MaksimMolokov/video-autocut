@@ -1,0 +1,60 @@
+preset_id: fast_reels
+name: Fast Reels
+emoji: "⚡"
+description: Быстрый агрессивный монтаж для Reels, TikTok, Shorts. Резки в бит.
+recommended_for: [reels, tiktok, shorts, соцсети, viral, быстро]
+dynamic_level: fast
+
+clip_selection:
+  segment_min_duration: 0.8
+  segment_max_duration: 3.0
+  prefer_wide_shots: false
+  prefer_stable: false
+  prefer_high_motion: true
+  min_quality_score: 0.40
+
+transitions:
+  type: cut
+  duration: 0.0
+  randomize: false
+
+speed_effects:
+  enabled: true
+  mode: speed_up
+  speed_up_factor: 1.3
+
+color:
+  style: high_contrast
+  saturation_boost: 0.20
+  contrast_boost: 0.20
+
+music_sync:
+  mode: beat_sync
+  cut_on_beat: true
+  cut_on_strong_beat: true
+  beat_snap_tolerance: 0.08
+
+scoring_weights:
+  sharpness: 0.7
+  stability: 0.4           # fast content can tolerate some shake
+  brightness: 1.0
+  colorfulness: 1.2
+  motion: 1.5              # high motion strongly preferred
+  face_presence: 0.8
+  aesthetic_score: 0.6
+
+segment_selection:
+  preferred_scene_categories: [action, people, sport, urban, crowd]
+  preferred_camera_motion: [shake, handheld, pan_left, pan_right, zoom_in]
+  rejected_camera_motion: [landing, takeoff]
+  min_scores:
+    quality_score: 0.35
+    brightness: 0.30
+  role_rules:
+    intro:
+      preferred_tags: [action, sport, crowd, energetic]
+      duration_sec: {min: 0.5, max: 2}
+    main_part:
+      preferred_tags: [action, people, crowd, sport]
+    ending:
+      preferred_tags: [action, crowd, people]

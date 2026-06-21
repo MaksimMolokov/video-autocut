@@ -22,6 +22,15 @@ TEST_SUITES = [
     ('FFmpeg Integration (Part 5)',      'tests.test_ffmpeg_integration'),
     ('Regression Tests (Parts 7–10)',    'tests.test_regression_full'),
     ('Regeneration Flow',                'tests.test_regeneration'),
+    # VI2 layer tests
+    ('Reject Reason Builder (VI2-013)', 'tests.test_reject_reason_builder'),
+    ('Scoring Service (VI2-012/016)',    'tests.test_scoring_service'),
+    ('Timeline Service (VI2-011)',       'tests.test_timeline_service'),
+    ('Shot Boundary Detector (VI2-010)','tests.test_shot_boundary_detector'),
+    ('Composition Analyzer (VI2-008)',   'tests.test_composition_analyzer'),
+    ('Pose Analyzer (VI2-007)',          'tests.test_pose_analyzer'),
+    ('Eye State Analyzer (VI2-007)',     'tests.test_eye_state_analyzer'),
+    ('Video Intelligence Service',       'tests.test_video_intelligence_service'),
 ]
 
 

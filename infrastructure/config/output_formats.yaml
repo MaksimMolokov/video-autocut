@@ -1,0 +1,112 @@
+# Output formats — independent of style and duration (TZ section 8)
+# Format = aspect ratio + resolution + crop strategy
+
+formats:
+
+  youtube_shorts:
+    id: youtube_shorts
+    name: YouTube Shorts
+    aspect_ratio: "9:16"
+    width: 1080
+    height: 1920
+    fps: 30
+    typical_duration: [15, 60]
+    crop_strategy: smart     # face/saliency-based crop
+    codec: h264
+    bitrate: "8M"
+
+  instagram_reels:
+    id: instagram_reels
+    name: Instagram Reels
+    aspect_ratio: "9:16"
+    width: 1080
+    height: 1920
+    fps: 30
+    typical_duration: [15, 90]
+    crop_strategy: smart
+    codec: h264
+    bitrate: "8M"
+
+  tiktok:
+    id: tiktok
+    name: TikTok
+    aspect_ratio: "9:16"
+    width: 1080
+    height: 1920
+    fps: 30
+    typical_duration: [10, 60]
+    crop_strategy: smart
+    codec: h264
+    bitrate: "8M"
+
+  youtube_horizontal:
+    id: youtube_horizontal
+    name: YouTube Horizontal
+    aspect_ratio: "16:9"
+    width: 1920
+    height: 1080
+    fps: 30
+    typical_duration: [60, 600]
+    crop_strategy: center
+    codec: h264
+    bitrate: "10M"
+
+  fullhd_horizontal:
+    id: fullhd_horizontal
+    name: Full HD 16:9
+    aspect_ratio: "16:9"
+    width: 1920
+    height: 1080
+    fps: 30
+    typical_duration: [0, 9999]
+    crop_strategy: center
+    codec: h264
+    bitrate: "12M"
+
+  uhd_4k:
+    id: uhd_4k
+    name: 4K Horizontal
+    aspect_ratio: "16:9"
+    width: 3840
+    height: 2160
+    fps: 30
+    typical_duration: [0, 9999]
+    crop_strategy: center
+    codec: h264
+    bitrate: "40M"
+
+  square:
+    id: square
+    name: Square 1:1
+    aspect_ratio: "1:1"
+    width: 1080
+    height: 1080
+    fps: 30
+    typical_duration: [15, 60]
+    crop_strategy: smart
+    codec: h264
+    bitrate: "8M"
+
+  wide_cinematic:
+    id: wide_cinematic
+    name: Wide Cinematic 21:9
+    aspect_ratio: "21:9"
+    width: 2560
+    height: 1080
+    fps: 24
+    typical_duration: [30, 9999]
+    crop_strategy: center
+    codec: h264
+    bitrate: "15M"
+
+  custom:
+    id: custom
+    name: Custom
+    aspect_ratio: "custom"
+    width: null
+    height: null
+    fps: 30
+    typical_duration: [0, 9999]
+    crop_strategy: center
+    codec: h264
+    bitrate: "10M"

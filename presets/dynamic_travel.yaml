@@ -1,0 +1,58 @@
+preset_id: dynamic_travel
+name: Dynamic Travel
+emoji: "✈️"
+description: Энергичный монтаж для поездок, прогулок и городских съёмок. Средний темп.
+recommended_for: [travel, город, поездка, прогулка, улица, vlog]
+dynamic_level: balanced
+
+clip_selection:
+  segment_min_duration: 2.0
+  segment_max_duration: 5.0
+  prefer_wide_shots: false
+  prefer_stable: false
+  prefer_variety: true
+  min_quality_score: 0.45
+
+transitions:
+  type: cut
+  duration: 0.0
+  randomize: false
+
+speed_effects:
+  enabled: false
+
+color:
+  style: natural
+  saturation_boost: 0.10
+  contrast_boost: 0.05
+
+music_sync:
+  mode: beat_sync
+  cut_on_beat: true
+  beat_snap_tolerance: 0.12
+
+scoring_weights:
+  sharpness: 0.9
+  stability: 0.6
+  brightness: 0.9
+  colorfulness: 1.0
+  motion: 0.9
+  face_presence: 0.6
+  aesthetic_score: 0.8
+  variety_bonus: 1.0
+
+segment_selection:
+  preferred_scene_categories: [urban, nature, people, landscape, beach, outdoor]
+  preferred_camera_motion: [pan_left, pan_right, tilt_up, aerial_forward, handheld, dolly]
+  rejected_camera_motion: [landing, takeoff, chaotic]
+  min_scores:
+    quality_score: 0.40
+    stability: 0.35
+  role_rules:
+    intro:
+      preferred_tags: [aerial, landscape, urban, establishing_shot]
+      duration_sec: {min: 2, max: 5}
+    main_part:
+      preferred_tags: [people, urban, nature, activity]
+    ending:
+      preferred_tags: [sunset, aerial, landscape]

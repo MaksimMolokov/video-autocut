@@ -71,6 +71,15 @@ class ExportQuality(Enum):
     HIGH = "high"
 
 
+class HardwareAcceleration(Enum):
+    """Hardware acceleration modes"""
+    AUTO = "auto"
+    NONE = "none"
+    CUDA = "cuda"
+    VIDEOTOOLBOX = "videotoolbox"
+    VAAPI = "vaapi"
+
+
 class StabilizationLevel(Enum):
     """Video stabilization levels"""
     NONE = "none"

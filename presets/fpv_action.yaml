@@ -1,0 +1,62 @@
+preset_id: fpv_action
+name: FPV Action
+emoji: "🚀"
+description: Экстремальный FPV-монтаж для дронов, экшн-спорта, гонок и аттракционов. Агрессивные ракурсы.
+recommended_for: [fpv, drone, экшн, экстремальный, гонки, скейт, мото, велоспорт, паркур, action]
+dynamic_level: extreme
+
+clip_selection:
+  segment_min_duration: 0.5
+  segment_max_duration: 3.5
+  prefer_wide_shots: false
+  prefer_stable: false
+  prefer_high_motion: true
+  min_quality_score: 0.30     # FPV inherently has motion blur, lower bar
+
+transitions:
+  type: cut
+  duration: 0.0
+  randomize: false
+
+speed_effects:
+  enabled: true
+  mode: speed_up
+  speed_up_factor: 1.5
+  ramp_duration: 0.3
+
+color:
+  style: high_contrast
+  saturation_boost: 0.25
+  contrast_boost: 0.30
+  warmth: -0.05
+
+music_sync:
+  mode: beat_sync
+  cut_on_beat: true
+  cut_on_strong_beat: true
+  beat_snap_tolerance: 0.06
+
+scoring_weights:
+  sharpness: 0.5            # motion blur is acceptable
+  stability: 0.2            # shake is part of FPV aesthetic
+  brightness: 0.9
+  colorfulness: 1.3
+  motion: 2.0               # extreme motion is the point
+  face_presence: 0.3
+  aesthetic_score: 0.5
+
+segment_selection:
+  preferred_scene_categories: [action, sport, aerial, outdoor, extreme, crowd, urban]
+  preferred_camera_motion: [aerial_forward, aerial_descent, shake, zoom_in, pan_left, pan_right, handheld]
+  rejected_camera_motion: [static, landing, takeoff]
+  min_scores:
+    quality_score: 0.25
+    motion: 0.40
+  role_rules:
+    intro:
+      preferred_tags: [aerial, action, sport, extreme, wide_shot]
+      duration_sec: {min: 0.5, max: 2.5}
+    main_part:
+      preferred_tags: [action, sport, extreme, aerial, crowd]
+    ending:
+      preferred_tags: [action, aerial, crowd, wide_shot]

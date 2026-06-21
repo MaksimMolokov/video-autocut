@@ -41,6 +41,10 @@ class FFmpegRenderer:
         music_fade_in: float = 3.0,
         music_fade_out: float = 3.0,
         music_start_time: float = 0.0,
+        voiceover_path: Optional[str] = None,
+        voiceover_volume: float = 0.9,
+        music_volume: float = 0.3,
+        subtitle_path: Optional[str] = None,
         effects_config: Optional[EffectsConfiguration] = None,
         progress_callback=None,
         vertical_mode: str = VERTICAL_MODE_CENTER_CROP,
@@ -81,19 +85,41 @@ class FFmpegRenderer:
 
             # Step 1: Extract and scale segments
             segment_files = FFmpegRenderer._extract_segments(
-                segments, width, height, temp_path, progress_callback, vertical_mode
+                segments, width, height, temp_path, progress_callback, vertical_mode,
+                effects_config=effects_config,
             )
 
             # Step 2: Concatenate segments
             # Use xfade transitions when a non-trivial transition is requested
             # and segment count is manageable; otherwise use fast concat demuxer.
             video_no_audio = temp_path / "video_no_audio.mp4"
+
+            # TR-1 (ROADMAP Фаза 7): per-cut переходы из seg.transition_to_next.
+            # 'cut'/'match_cut' → почти нулевая длительность (жёсткий рез);
+            # 'crossfade' → реальный кроссфейд. Применяем, только если есть хотя бы
+            # один кроссфейд (иначе быстрый concat-демультиплексор дешевле).
+            per_cut = [getattr(s, "transition_to_next", None) for s in segments[:-1]]
+            _has_per_cut = any(t for t in per_cut)
+            _any_crossfade = any(t == "crossfade" for t in per_cut)
+
             _use_xfade = (
                 between_clip_transition not in ('none', 'cut', 'clean_cut', '')
                 and len(segment_files) <= 20
                 and between_clip_transition_dur > 0.05
             )
-            if _use_xfade:
+            if _has_per_cut and _any_crossfade and len(segment_files) <= 20:
+                # Смешанные переходы: резы — concat, кроссфейды — xfade между прогонами.
+                cross = max(0.2, between_clip_transition_dur if between_clip_transition_dur > 0.05 else 0.4)
+                if progress_callback:
+                    progress_callback(
+                        f"[Transitions] Per-cut: {sum(1 for t in per_cut if t=='crossfade')} "
+                        f"crossfade / {sum(1 for t in per_cut if t!='crossfade')} match-cut"
+                    )
+                FFmpegRenderer._concatenate_mixed(
+                    segment_files, video_no_audio,
+                    transitions=[t or "cut" for t in per_cut], crossfade_dur=cross,
+                )
+            elif _use_xfade:
                 if progress_callback:
                     progress_callback(
                         f"[Transitions] Applying {between_clip_transition} "
@@ -121,19 +147,33 @@ class FFmpegRenderer:
                     f"[Render] Silent video duration mismatch: {silent_check.get('error')}"
                 )
 
-            # Step 3: Add music if provided
-            if music_path:
+            # Step 3: Add audio tracks
+            # When subtitles will be burned we need an intermediate file
+            _audio_out = output_path if not subtitle_path else str(temp_path / "with_audio.mp4")
+
+            if voiceover_path and music_path:
+                FFmpegRenderer._add_multi_track_audio(
+                    video_no_audio, voiceover_path, music_path, _audio_out,
+                    music_fade_in, music_fade_out, music_start_time,
+                    voiceover_volume, music_volume,
+                )
+            elif voiceover_path:
+                FFmpegRenderer._add_voiceover_only(
+                    video_no_audio, voiceover_path, _audio_out, voiceover_volume,
+                )
+            elif music_path:
                 FFmpegRenderer._add_music(
-                    video_no_audio,
-                    music_path,
-                    output_path,
-                    music_fade_in,
-                    music_fade_out,
-                    music_start_time
+                    video_no_audio, music_path, _audio_out,
+                    music_fade_in, music_fade_out, music_start_time,
                 )
             else:
-                # No music, just copy video
-                FFmpegRenderer._copy_file(video_no_audio, output_path)
+                FFmpegRenderer._copy_file(video_no_audio, _audio_out)
+
+            # Step 3b: Burn-in subtitles (requires re-encode of video track)
+            if subtitle_path and Path(subtitle_path).exists():
+                if progress_callback:
+                    progress_callback("[Subtitles] Burning subtitles into video…")
+                FFmpegRenderer._burn_subtitles(_audio_out, subtitle_path, output_path)
 
         # Step 4: Post-render validation on the final file.
         final_check = FFmpegRenderer._validate_output(
@@ -247,14 +287,15 @@ class FFmpegRenderer:
         elif vertical_mode == VERTICAL_MODE_RIGHT_CROP:
             crop_x = "iw-ow"
         else:
-            # center_crop: shift crop toward detected face when available
+            # center_crop: shift crop toward detected face/subject when available.
             if abs(face_center_x - 0.5) > 0.08:
-                # face_center_x is in normalized [0,1] of the SCALED frame.
-                # After scaling, frame width = out_w * (source_ar / target_ar).
-                # We approximate: shift = (face_center_x - 0.5) * (iw - ow)
-                # Use FFmpeg ternary to clamp between 0 and iw-ow.
-                shift_ratio = max(-0.45, min(0.45, face_center_x - 0.5))
-                crop_x = f"clip((iw-ow)/2+{shift_ratio:.4f}*(iw-ow),0,iw-ow)"
+                # crop_x = (iw-ow) * factor. factor = clamp(center, 0.05..0.95) is
+                # always in [0,1] ⇒ результат всегда в [0, iw-ow], clip() не нужен.
+                # ВАЖНО: не использовать clip()/min()/max() здесь — запятые внутри
+                # функции ломают разбор filtergraph (ffmpeg видит ',' как разделитель
+                # фильтров → "No such filter: '0'"). Поэтому только умножение.
+                factor = max(0.05, min(0.95, face_center_x))
+                crop_x = f"(iw-ow)*{factor:.4f}"
             else:
                 crop_x = "(iw-ow)/2"
 
@@ -392,6 +433,7 @@ class FFmpegRenderer:
         temp_path: Path,
         progress_callback,
         vertical_mode: str = VERTICAL_MODE_CENTER_CROP,
+        effects_config: Optional["EffectsConfiguration"] = None,
     ) -> List[Path]:
         """
         Extract, scale and adapt segments to temporary files.
@@ -449,28 +491,52 @@ class FFmpegRenderer:
                 "-an",
             ]
 
-            # Smart reframing: use face_center_x from segment features if available
-            _face_cx = 0.5
-            try:
-                from src.video_analysis.candidate_builder import CandidateClip
-                if hasattr(seg, '_candidate') and seg._candidate is not None:
-                    f = seg._candidate.features
-                    if f is not None:
-                        _face_cx = getattr(f, 'face_center_x', 0.5)
-            except Exception:
-                pass
-            vf = FFmpegRenderer._build_video_filter(width, height, vertical_mode, _face_cx)
+            # Smart reframing (ROADMAP Фаза 4, RF-1): per-segment crop center.
+            # Priority: explicit crop_center_x (set by SmartCrop in the frontend) →
+            # legacy candidate features → frame centre.
+            _face_cx = getattr(seg, 'crop_center_x', None)
+            if _face_cx is None:
+                _face_cx = 0.5
+                try:
+                    from src.video_analysis.candidate_builder import CandidateClip
+                    if hasattr(seg, '_candidate') and seg._candidate is not None:
+                        f = seg._candidate.features
+                        if f is not None:
+                            _face_cx = getattr(f, 'face_center_x', 0.5)
+                except Exception:
+                    pass
+            vf = FFmpegRenderer._build_video_filter(width, height, vertical_mode, float(_face_cx))
 
             # Per-segment visual transitions (intro fade-in / outro fade-out).
             seg_role = getattr(seg, 'role', 'body')
             fade_filters = FFmpegRenderer._build_role_fade_filters(seg, seg_role)
 
+            # Build optional color grading + vignette filters from effects_config
+            _color_filters = ""
+            if effects_config is not None and effects_config.color.enabled:
+                try:
+                    from src.effects_engine import EffectsEngine
+                    cf = EffectsEngine.generate_color_filter(
+                        effects_config.color.style,
+                        effects_config.color.brightness,
+                        effects_config.color.contrast,
+                        effects_config.color.saturation,
+                        effects_config.color.temperature,
+                    )
+                    if cf:
+                        _color_filters = "," + cf
+                    if effects_config.color.vignette:
+                        _color_filters += ",vignette=PI/4"
+                except Exception:
+                    pass
+
             if vf == "__FILTER_COMPLEX__":
                 fc_base = FFmpegRenderer._build_filter_complex_blur(width, height)
-                # Build normalization + fade suffix on the composited [out] stream.
                 norm_fade = f"fps={_NORM_FPS},format={_NORM_PIXFMT}"
                 if fade_filters:
                     norm_fade += "," + fade_filters
+                if _color_filters:
+                    norm_fade += _color_filters
                 fc = fc_base.replace(
                     "[out]",
                     f"[outraw];[outraw]{norm_fade}[out]"
@@ -484,6 +550,8 @@ class FFmpegRenderer:
                 vf_full = vf + f",fps={_NORM_FPS},format={_NORM_PIXFMT}"
                 if fade_filters:
                     vf_full += "," + fade_filters
+                if _color_filters:
+                    vf_full += _color_filters
                 cmd = cmd_base + ["-vf", vf_full, str(output_file)]
 
             try:
@@ -575,6 +643,7 @@ class FFmpegRenderer:
         output_file: Path,
         transition_type: str = 'fade',
         transition_dur: float = 0.5,
+        transition_durs: Optional[List[float]] = None,
     ):
         """
         Concatenate segments using FFmpeg xfade filter for real between-clip
@@ -586,6 +655,11 @@ class FFmpegRenderer:
         Supported transition_type values (xfade filter tokens):
           'fade', 'wipeleft', 'wiperight', 'slideleft', 'slideright',
           'circleopen', 'pixelize', 'hblur', 'radial', 'zoomin'
+
+        transition_durs (ROADMAP Фаза 7, TR-1): необязательный список длительностей
+        переходов ПО ГРАНИЦАМ (len = n-1). Match-cut/cut-on-action получают почти
+        нулевую длительность (~1 кадр = жёсткий рез), «рваные» стыки — реальный
+        кроссфейд. Если None — используется единый transition_dur для всех границ.
         """
         n = len(segment_files)
         if n == 0:
@@ -623,20 +697,25 @@ class FFmpegRenderer:
                 'beat_flash': 'fade', 'clean_cut': 'fade',
             }
             xf = xfade_map.get(transition_type, 'fade')
-            d = max(0.05, min(transition_dur, 1.0))
+            d_uniform = max(0.05, min(transition_dur, 1.0))
 
             filter_parts = []
             current_label = "[0:v]"
             offset = 0.0
 
             for idx in range(1, n):
+                # Длительность перехода для ЭТОЙ границы (TR-1: per-cut).
+                if transition_durs is not None and idx - 1 < len(transition_durs):
+                    d = max(0.03, min(float(transition_durs[idx - 1]), 1.0))
+                else:
+                    d = d_uniform
                 prev_dur = durations[idx - 1]
                 offset += prev_dur - d
                 offset = max(0.01, offset)
                 out_label = f"[v{idx}]"
                 filter_parts.append(
                     f"{current_label}[{idx}:v]"
-                    f"xfade=transition={xf}:duration={d}:offset={offset:.3f}"
+                    f"xfade=transition={xf}:duration={d:.3f}:offset={offset:.3f}"
                     f"{out_label}"
                 )
                 current_label = out_label
@@ -662,6 +741,53 @@ class FFmpegRenderer:
                 f"falling back to concat demuxer"
             )
             FFmpegRenderer._concatenate_segments_simple(segment_files, output_file)
+
+    @staticmethod
+    def _concatenate_mixed(
+        segment_files: List[Path],
+        output_file: Path,
+        transitions: List[str],
+        crossfade_dur: float = 0.4,
+    ):
+        """Смешанные переходы по границам (ROADMAP Фаза 7, TR-1).
+
+        ``transitions`` (len = n-1): 'crossfade' или иное (рез). Жёсткие резы
+        НЕ прогоняются через xfade (это ломает цепочку при крошечной длительности) —
+        вместо этого соседние «cut»-сегменты склеиваются concat-демультиплексором
+        без потерь, а xfade применяется ТОЛЬКО между получившимися «прогонами».
+        """
+        n = len(segment_files)
+        if n <= 1:
+            FFmpegRenderer._concatenate_segments_simple(segment_files, output_file)
+            return
+        # Сгруппировать в «прогоны», разделённые границами-кроссфейдами.
+        runs: List[List[Path]] = []
+        cur: List[Path] = [segment_files[0]]
+        for i, t in enumerate(transitions[: n - 1]):
+            if t == "crossfade":
+                runs.append(cur)
+                cur = [segment_files[i + 1]]
+            else:
+                cur.append(segment_files[i + 1])
+        runs.append(cur)
+
+        if len(runs) == 1:                      # кроссфейдов нет → быстрый concat
+            FFmpegRenderer._concatenate_segments_simple(runs[0], output_file)
+            return
+
+        # Каждый прогон → отдельный файл (жёсткая склейка без потерь).
+        run_files: List[Path] = []
+        for j, run in enumerate(runs):
+            if len(run) == 1:
+                run_files.append(run[0])
+            else:
+                rf = output_file.parent / f"run_{j:03d}.mp4"
+                FFmpegRenderer._concatenate_segments_simple(run, rf)
+                run_files.append(rf)
+        # Между прогонами — равномерный кроссфейд (надёжная ветка xfade).
+        FFmpegRenderer._concatenate_with_xfade(
+            run_files, output_file, transition_type="fade", transition_dur=crossfade_dur
+        )
 
     @staticmethod
     def _concatenate_segments_simple(segment_files: List[Path], output_file: Path):
@@ -830,6 +956,128 @@ class FFmpegRenderer:
             subprocess.run(cmd, check=True, capture_output=True, text=True)
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"Failed to add music: {e.stderr}")
+
+    @staticmethod
+    def _burn_subtitles(video_path: str, srt_path: str, output_path: str) -> None:
+        """Re-encode video with subtitles burned in via the subtitles vf filter."""
+        # Escape colons/backslashes in path for FFmpeg filter syntax
+        safe_srt = str(srt_path).replace("\\", "/").replace(":", "\\:")
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", str(video_path),
+            "-vf", f"subtitles='{safe_srt}':force_style='FontSize=18,PrimaryColour=&H00FFFFFF&,OutlineColour=&H00000000&,Outline=2'",
+            "-c:v", "libx264", "-preset", "medium", "-crf", "23",
+            "-c:a", "copy",
+            output_path,
+        ]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"Failed to burn subtitles: {e.stderr[-400:]}")
+
+    @staticmethod
+    def _add_voiceover_only(
+        video_path: Path,
+        voiceover_path: str,
+        output_path: str,
+        voiceover_volume: float = 0.9,
+    ):
+        """Attach a single voiceover track, trimmed to video duration."""
+        video_dur = FFmpegRenderer._get_duration(video_path)
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", str(video_path),
+            "-i", voiceover_path,
+            "-filter_complex",
+            f"[1:a]volume={voiceover_volume},atrim=0:{video_dur},"
+            f"asetpts=PTS-STARTPTS[a]",
+            "-map", "0:v", "-map", "[a]",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+            output_path,
+        ]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"Failed to add voiceover: {e.stderr[-400:]}")
+
+    @staticmethod
+    def _add_multi_track_audio(
+        video_path: Path,
+        voiceover_path: str,
+        music_path: str,
+        output_path: str,
+        music_fade_in: float = 3.0,
+        music_fade_out: float = 3.0,
+        music_start_time: float = 0.0,
+        voiceover_volume: float = 0.9,
+        music_volume: float = 0.3,
+    ):
+        """Mix voiceover (0.9 vol) + background music (0.3 vol) over video."""
+        video_dur = FFmpegRenderer._get_duration(video_path)
+        music_dur = FFmpegRenderer._get_media_duration(music_path)
+        available = max(0.01, music_dur - music_start_time)
+        needs_loop = available < video_dur
+        loops_needed = min(math.ceil(video_dur / available), 12) if needs_loop else 1
+        fade_out_start = max(0.0, video_dur - music_fade_out)
+
+        # Build inputs: [0]=video, [1]=voiceover, [2..N]=music copies
+        inputs = ["-i", str(video_path), "-i", voiceover_path]
+        for _ in range(loops_needed):
+            inputs += ["-i", music_path]
+
+        filter_parts = []
+
+        # Voiceover stream
+        filter_parts.append(
+            f"[1:a]volume={voiceover_volume},"
+            f"atrim=0:{video_dur},asetpts=PTS-STARTPTS[vo]"
+        )
+
+        # Music: loop if needed, then trim + fades + volume
+        if needs_loop:
+            loop_labels = []
+            for i in range(loops_needed):
+                lbl = f"[lp{i}]"
+                loop_labels.append(lbl)
+                filter_parts.append(
+                    f"[{i+2}:a]"
+                    f"atrim=start={music_start_time}:end={music_dur},"
+                    f"asetpts=PTS-STARTPTS{lbl}"
+                )
+            concat_in = "".join(loop_labels)
+            filter_parts.append(f"{concat_in}concat=n={loops_needed}:v=0:a=1[looped]")
+            filter_parts.append(
+                f"[looped]atrim=0:{video_dur},asetpts=PTS-STARTPTS,"
+                f"afade=t=in:st=0:d={music_fade_in},"
+                f"afade=t=out:st={fade_out_start}:d={music_fade_out},"
+                f"volume={music_volume}[mu]"
+            )
+        else:
+            filter_parts.append(
+                f"[2:a]atrim=start={music_start_time}:duration={video_dur},"
+                f"asetpts=PTS-STARTPTS,"
+                f"afade=t=in:st=0:d={music_fade_in},"
+                f"afade=t=out:st={fade_out_start}:d={music_fade_out},"
+                f"volume={music_volume}[mu]"
+            )
+
+        # Merge voiceover + music
+        filter_parts.append("[vo][mu]amix=inputs=2:duration=longest:normalize=0[a]")
+
+        cmd = (
+            ["ffmpeg", "-y"]
+            + inputs
+            + [
+                "-filter_complex", ";".join(filter_parts),
+                "-map", "0:v", "-map", "[a]",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                output_path,
+            ]
+        )
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"Failed to mix audio tracks: {e.stderr[-400:]}")
 
     @staticmethod
     def _get_media_duration(file_path: str) -> float:

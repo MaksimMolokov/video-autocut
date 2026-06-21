@@ -1,4 +1,15 @@
-"""Scene splitting via PySceneDetect with OpenCV fallback."""
+"""
+Scene splitting via PySceneDetect with OpenCV fallback.
+
+Algorithm selection (based on research):
+  AdaptiveDetector (default) — rolling-average of HSV frame differences.
+  Unlike ContentDetector (fixed threshold=27), AdaptiveDetector computes
+  frame_score / rolling_avg > adaptive_threshold (default 3.0), which
+  self-adjusts to camera motion and avoids false positives on fast pans.
+  Reference: PySceneDetect docs, github.com/Breakthrough/PySceneDetect
+
+  ContentDetector is kept as secondary for hard-cut-heavy content.
+"""
 
 import logging
 import subprocess
@@ -21,8 +32,8 @@ class Scene:
 class SceneDetector:
     def __init__(
         self,
-        threshold: float = 27.0,
-        frame_skip: int = 5,
+        threshold: float = 3.0,    # adaptive_threshold for AdaptiveDetector
+        frame_skip: int = 2,        # lowered from 5 → finer detection
         min_scene_length: float = 0.8,
     ):
         self.threshold = threshold
@@ -38,15 +49,17 @@ class SceneDetector:
 
     def _split_pyscenedetect(self, video_path: str) -> List[Scene]:
         from scenedetect import open_video, SceneManager
-        from scenedetect.detectors import ContentDetector
+        from scenedetect.detectors import AdaptiveDetector
 
         video = open_video(video_path)
 
         manager = SceneManager()
+        # AdaptiveDetector: rolling-average normalisation makes it robust to
+        # fast camera moves that cause ContentDetector false positives.
         manager.add_detector(
-            ContentDetector(
-                threshold=self.threshold,
-                min_scene_len=self.min_scene_length,  # 0.7+ accepts float seconds
+            AdaptiveDetector(
+                adaptive_threshold=self.threshold,   # default 3.0
+                min_scene_len=self.min_scene_length,
             )
         )
         manager.detect_scenes(video, frame_skip=self.frame_skip)

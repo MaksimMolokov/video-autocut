@@ -28,16 +28,27 @@ class ScoreResult:
     travel_score: float
 
 
+# Travel tags that boost travel_score (CLIP semantic tags from Level 4)
+_TRAVEL_TAGS = frozenset({'nature', 'ocean', 'mountains'})
+# Interior/city tags that reduce travel_score
+_NON_TRAVEL_TAGS = frozenset({'interior', 'architecture', 'food'})
+
+
 class ClipScorer:
 
-    def score(self, m: TechMetrics, c: Optional[ContentMetrics] = None) -> ScoreResult:
+    def score(
+        self,
+        m: TechMetrics,
+        c: Optional[ContentMetrics] = None,
+        scene_tag: Optional[str] = None,
+    ) -> ScoreResult:
         return ScoreResult(
             quality_score=self._quality(m, c),
             cinematic_score=self._cinematic(m),
             action_score=self._action(m),
             social_score=self._social(m, c),
             premium_score=self._premium(m),
-            travel_score=self._travel(m, c),
+            travel_score=self._travel(m, c, scene_tag),
         )
 
     # ------------------------------------------------------------------
@@ -48,25 +59,29 @@ class ClipScorer:
         motion_ok     = 1.0 if 0.04 < m.motion < 0.72 else 0.4
         overexpose_ok = 0.3 if m.overexpose else 1.0
         has_subject   = float(c.has_subject) if c else 0.5
+        colorfulness  = float(getattr(m, 'colorfulness', 0.0))
 
         base = (
-            0.25 * m.sharpness    +
-            0.20 * brightness_ok  +
-            0.20 * m.stability    +
-            0.15 * overexpose_ok  +
-            0.10 * motion_ok      +
-            0.10 * has_subject
+            0.22 * m.sharpness    +
+            0.18 * brightness_ok  +
+            0.18 * m.stability    +
+            0.13 * overexpose_ok  +
+            0.09 * motion_ok      +
+            0.10 * has_subject    +
+            0.10 * colorfulness
         )
         return round(min(1.0, max(0.0, base)), 3)
 
     @staticmethod
     def _cinematic(m: TechMetrics) -> float:
         smooth_motion = 1.0 - min(1.0, m.motion * 1.5)
+        composition   = float(getattr(m, 'composition_score', 0.0))
         return round(min(1.0, max(0.0,
-            0.35 * m.stability +
-            0.30 * m.sharpness +
-            0.20 * smooth_motion +
-            0.15 * m.brightness
+            0.30 * m.stability    +
+            0.25 * m.sharpness    +
+            0.18 * smooth_motion  +
+            0.12 * m.brightness   +
+            0.15 * composition
         )), 3)
 
     @staticmethod
@@ -97,11 +112,21 @@ class ClipScorer:
         )), 3)
 
     @staticmethod
-    def _travel(m: TechMetrics, c: Optional[ContentMetrics]) -> float:
+    def _travel(
+        m: TechMetrics,
+        c: Optional[ContentMetrics],
+        scene_tag: Optional[str] = None,
+    ) -> float:
         has_face = float(c.has_face) if c else 0.0
-        return round(min(1.0, max(0.0,
+        base = (
             0.30 * m.sharpness +
             0.25 * m.brightness +
             0.25 * m.stability +
             0.20 * has_face
-        )), 3)
+        )
+        # CLIP semantic boost: nature/ocean/mountains → +0.12; interior/food → –0.10
+        if scene_tag in _TRAVEL_TAGS:
+            base += 0.12
+        elif scene_tag in _NON_TRAVEL_TAGS:
+            base -= 0.10
+        return round(min(1.0, max(0.0, base)), 3)

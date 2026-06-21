@@ -26,6 +26,7 @@ ALL_14_STYLE_IDS = [
     'social_media_punchy', 'business_promo_clean', 'real_estate_property_tour',
     'travel_story', 'event_highlights', 'calm_minimal_documentary',
     'sport_dynamic_cut', 'sport_highlight_impact',
+    'f1', 'f2', 'f3', 'f4', 'f5', 'f6',
 ]
 
 # Styles that go through TimelineBuilder (not EasyClipSelector)

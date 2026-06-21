@@ -1,0 +1,21 @@
+[theme]
+base                  = "dark"
+backgroundColor       = "#0B0F12"
+secondaryBackgroundColor = "#12171D"
+textColor             = "#E8EDF2"
+primaryColor          = "#00FF88"
+font                  = "sans serif"
+
+[server]
+headless              = true
+runOnSave             = false
+# ВАЖНО: "none", а не "poll"/"auto". File-watcher Streamlit обходит пути модулей и
+# падает на torch.classes (RuntimeError "Tried to instantiate class '__path__._path'")
+# как только в процессе импортируется torch (Silero VAD / Whisper / CLIP). Из-за
+# этого приложение «зависало» после анализа (переходы между экранами не работали).
+fileWatcherType       = "none"
+maxUploadSize         = 10240
+maxMessageSize        = 10240
+
+[browser]
+gatherUsageStats      = false

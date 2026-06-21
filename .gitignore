@@ -33,3 +33,7 @@ streamlit.log
 # Test outputs
 /output/
 /VideoProjects/
+
+# Runtime data (analysis cache db, logs, streamlit output)
+.videoeditor/
+.streamlit/secrets.toml
