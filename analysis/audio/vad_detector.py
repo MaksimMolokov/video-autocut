@@ -184,8 +184,30 @@ class VADDetector:
 
     # ── загрузка аудио ─────────────────────────────────────────────────────────
     @staticmethod
+    def _has_audio_stream(abs_path: str) -> bool:
+        """Быстрый ffprobe-précheck: есть ли в файле аудиодорожка.
+
+        Читает только заголовки (доли секунды), с жёстким таймаутом. Без этого
+        librosa.load декодировал бы весь файл и зависал на больших/облачных видео.
+        """
+        import subprocess
+        try:
+            r = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "a",
+                 "-show_entries", "stream=index", "-of", "csv=p=0", abs_path],
+                capture_output=True, text=True, timeout=15,
+            )
+            return bool(r.stdout.strip())
+        except Exception as exc:
+            logger.info("[VAD] ffprobe не смог проверить аудио в %s (%s) — пропуск", abs_path, exc)
+            return False
+
+    @staticmethod
     def _load_audio(abs_path: str):
         """Загрузить моно @16 кГц. Вернуть (np.ndarray|None, sr)."""
+        # Нет аудиодорожки (или ffprobe не ответил) → не пытаемся декодировать.
+        if not VADDetector._has_audio_stream(abs_path):
+            return None, _SAMPLE_RATE
         try:
             import librosa
             y, sr = librosa.load(abs_path, sr=_SAMPLE_RATE, mono=True)

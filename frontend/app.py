@@ -1619,11 +1619,10 @@ def _scene_card(frag: Dict, actions: Dict) -> None:
                 thumb_b64 = _b64.b64encode(_tf.read()).decode()
         except Exception:
             thumb_b64 = None
-    if not thumb_b64 and frag.get("_abs_path"):
-        # Live extraction: only if abs_path valid and times are non-zero
-        _t_mid = (frag.get("start_s", 0) + frag.get("end_s", 0)) / 2
-        if _t_mid > 0 or frag.get("end_s", 0) > 0:
-            thumb_b64 = _extract_thumb(frag["_abs_path"], _t_mid if _t_mid > 0 else 1.0)
+    # ВАЖНО: НЕ извлекать кадр из видео во время отрисовки карточки. Это читало
+    # файл с диска/облака на КАЖДОМ ререндере → при больших/облачных видео и многих
+    # сценах интерфейс «зависал» и клики не проходили. Превью берём только из кэша
+    # (генерируется при анализе); если его нет — показываем заглушку-иконку.
 
     reject_block = ""
     if frag.get("rejection_reason"):

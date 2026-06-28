@@ -348,7 +348,10 @@ def _analyze_one_video(abs_path: str, rel_path: str, pm: PathManager) -> List[di
     rms_values: list = []
     _speech_density = lambda ivals, a, b: 0.0       # noqa: E731  безопасный дефолт
     _audio_energy   = lambda t, v, a, b: 0.0        # noqa: E731
-    if cfg.get("analysis.enable_vad", True):
+    # ВЫКЛ по умолчанию: декодирование аудио из видео (librosa→ffmpeg) на больших/
+    # облачных файлах висит (stream timeout). Включается analysis.enable_vad=true,
+    # и даже тогда VADDetector сам пропускает файлы без аудиодорожки (ffprobe-précheck).
+    if cfg.get("analysis.enable_vad", False):
         try:
             from analysis.audio.vad_detector import VADDetector
             _vad_res = VADDetector().detect(abs_path)
