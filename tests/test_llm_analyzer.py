@@ -12,7 +12,8 @@ from core.models import Scene
 GOOD = {"scene_description": "Кафе", "objects": ["стол"], "people_count": 2,
         "emotions": ["радость"], "composition": "средний план", "lighting": "тёплый",
         "aesthetic_score": 0.8, "scene_type": "food", "recommended_slot": "main",
-        "tags": ["food", "cafe"], "usable_for_edit": True}
+        "tags": ["food", "cafe"], "usable_for_edit": True,
+        "subject_x": 0.3, "subject_y": 0.6}
 
 
 # --- _parse_json_lenient ---
@@ -69,6 +70,7 @@ def test_fill_scene_success(monkeypatch, tmp_path):
     assert s.description == "Кафе" and s.scene_type == "food"
     assert s.people_count == 2 and s.aesthetic_score == 0.8
     assert s.recommended_slot == "main"
+    assert (s.subject_x, s.subject_y) == (0.3, 0.6)  # позиция объекта для кропа
 
 
 def test_fill_scene_normalizes_10_scale(monkeypatch, tmp_path):
@@ -88,6 +90,41 @@ def test_fill_scene_not_usable_tag(monkeypatch, tmp_path):
     s = _scene()
     llm.fill_scene(s, tmp_path / "f.jpg")
     assert "not-usable" in s.tags
+
+
+def test_fill_scene_multiframe(monkeypatch, tmp_path):
+    """Длинная сцена: 2 кадра уходят одним запросом, ошибки нет."""
+    llm = LLMAnalyzer()
+    received = []
+    monkeypatch.setattr(llm, "analyze_frame",
+                        lambda frames: (received.append(frames), dict(GOOD))[1])
+    s = _scene()
+    f1, f2 = tmp_path / "a.jpg", tmp_path / "b.jpg"
+    assert llm.fill_scene(s, [f1, f2])
+    assert received == [[f1, f2]]
+    assert s.llm_status == "done"
+
+
+def test_analyze_frame_builds_multiimage_request(monkeypatch, tmp_path):
+    """Проверяем содержимое запроса: N кадров → N image_url + текст про развитие."""
+    llm = LLMAnalyzer()
+    f1, f2 = tmp_path / "a.jpg", tmp_path / "b.jpg"
+    f1.write_bytes(b"\xff\xd8fake1")
+    f2.write_bytes(b"\xff\xd8fake2")
+    captured = {}
+
+    class _FakeCompletions:
+        @staticmethod
+        def create(**kw):
+            captured.update(kw)
+            raise RuntimeError("стоп — дальше не идём")
+
+    monkeypatch.setattr(llm.client.chat, "completions", _FakeCompletions)
+    assert llm.analyze_frame([f1, f2]) is None  # RuntimeError перехвачен
+    content = captured["messages"][1]["content"]
+    images = [c for c in content if c["type"] == "image_url"]
+    assert len(images) == 2
+    assert "ОДНОЙ сцены" in content[0]["text"]
 
 
 def test_fill_scene_failure(monkeypatch, tmp_path):

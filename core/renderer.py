@@ -1,14 +1,17 @@
 """Preview / Final Renderer (ТЗ §17–18): сборка ролика по монтажному плану.
 
-Каждый сегмент нарезается ffmpeg-ом в единый промежуточный формат
-(разрешение целевого аспекта, кроп по центру безопасной области),
-затем конкатенация + наложение музыки.
+Каждый сегмент нарезается ffmpeg-ом в единый формат: умный кроп в
+координатах исходника (окно смещается к лицам — ТЗ §17 «не обрезать лица»),
+затем масштаб, конкатенация и наложение музыки.
 
-Preview: 540p-эквивалент, veryfast, crf 28 — быстрая проверка черновика.
-Final: полное разрешение, medium, crf 18, aac 192k.
+Сегменты кэшируются в cache/segments/ по содержимому (сцена + таймкоды +
+формат + кроп) — замена одного фрагмента пере-кодирует только его.
+
+Preview: половинное разрешение, veryfast, crf 28. Final: medium, crf 18.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import shutil
 import subprocess
@@ -16,9 +19,59 @@ from pathlib import Path
 
 import config
 from core.models import MontagePlan, Project, Scene
+from core.smart_crop import crop_window, find_focus
 from core.storage import Storage
 
 log = logging.getLogger(__name__)
+
+_SEGMENT_CACHE_MAX_BYTES = 3 * 1024 ** 3  # LRU-лимит кэша сегментов
+
+
+def _display_dims(storage: Storage, scene: Scene) -> tuple[int, int]:
+    """Размер кадра исходника с учётом поворота (для расчёта окна кропа)."""
+    video = storage.get_video(scene.video_id)
+    if video and video.width and video.height:
+        w, h = video.width, video.height
+        # orientation уже учитывает метаданные поворота (ffprobe side_data)
+        if video.orientation == "vertical" and w > h:
+            w, h = h, w
+        elif video.orientation == "horizontal" and h > w:
+            w, h = h, w
+        return w, h
+    # запись видео недоступна — быстрый пробник
+    import cv2
+    cap = cv2.VideoCapture(scene.video_path)
+    try:
+        return (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1920,
+                int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080)
+    finally:
+        cap.release()
+
+
+def _segment_focus(scene: Scene, seg) -> tuple[float, float] | None:
+    """Центр внимания для кропа, каскад (ТЗ §17 «не обрезать лица»):
+    1. CV-детекция лиц/силуэтов на кадрах сегмента,
+    2. позиция главного объекта от Qwen3-VL (subject_x/y из анализа сцены),
+    3. None → безопасный центральный кроп.
+    """
+    if seg.crop == "center":
+        return None
+    focus = find_focus(scene.video_path, seg.src_start, seg.src_end)
+    if focus:
+        return focus
+    if (scene.subject_x, scene.subject_y) != (0.5, 0.5):
+        return (scene.subject_x, scene.subject_y)
+    return None
+
+
+def _trim_segment_cache(cache_dir: Path):
+    """LRU: старейшие сегменты удаляются при превышении лимита."""
+    files = sorted(cache_dir.glob("*.mp4"), key=lambda p: p.stat().st_mtime)
+    total = sum(p.stat().st_size for p in files)
+    while total > _SEGMENT_CACHE_MAX_BYTES and files:
+        oldest = files.pop(0)
+        total -= oldest.stat().st_size
+        oldest.unlink(missing_ok=True)
 
 
 def render_plan(storage: Storage, project: Project, plan: MontagePlan,
@@ -35,16 +88,34 @@ def render_plan(storage: Storage, project: Project, plan: MontagePlan,
     quality = ["-preset", "medium", "-crf", "18"] if final \
         else ["-preset", "veryfast", "-crf", "28"]
 
-    # 1. Нарезка сегментов в единый формат
+    seg_cache = pdir / "cache" / "segments"
+    seg_cache.mkdir(parents=True, exist_ok=True)
+
+    # 1. Нарезка сегментов: умный кроп + пофрагментный кэш
     parts: list[Path] = []
     for seg in plan.segments:
         scene = storage.get_scene(seg.scene_id)
         if not scene:
             log.warning("Сцена %s не найдена, сегмент пропущен", seg.scene_id)
             continue
-        part = tmp_dir / f"{seg.order:03d}.mp4"
-        vf = (f"scale={w}:{h}:force_original_aspect_ratio=increase,"
-              f"crop={w}:{h},setsar=1,fps=30")
+
+        src_w, src_h = _display_dims(storage, scene)
+        focus = _segment_focus(scene, seg)
+        cw, ch, x, y = crop_window(src_w, src_h, w, h, focus)
+
+        key = hashlib.md5(
+            f"{seg.scene_id}:{seg.src_start:.3f}:{seg.src_end:.3f}:"
+            f"{w}x{h}:{'f' if final else 'p'}:{cw}x{ch}+{x}+{y}".encode()
+        ).hexdigest()[:16]
+        part = seg_cache / f"{key}.mp4"
+
+        if part.exists():
+            part.touch()  # обновляем mtime для LRU
+            parts.append(part)
+            progress(f"  сегмент {seg.order + 1}/{len(plan.segments)} [{seg.slot}] из кэша")
+            continue
+
+        vf = f"crop={cw}:{ch}:{x}:{y},scale={w}:{h},setsar=1,fps=30"
         cmd = [
             "ffmpeg", "-y", "-v", "error",
             "-ss", f"{seg.src_start:.3f}", "-i", scene.video_path,
@@ -55,9 +126,12 @@ def render_plan(storage: Storage, project: Project, plan: MontagePlan,
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if res.returncode != 0 or not part.exists():
             log.error("Сегмент %s не отрендерился: %s", seg.order, res.stderr[:300])
+            progress(f"  ⚠️ сегмент {seg.order + 1} пропущен (ошибка ffmpeg) — ролик будет короче")
             continue
         parts.append(part)
-        progress(f"  сегмент {seg.order + 1}/{len(plan.segments)} [{seg.slot}] {seg.duration:.1f}s")
+        face_note = " 👤" if focus else ""
+        progress(f"  сегмент {seg.order + 1}/{len(plan.segments)} [{seg.slot}] "
+                 f"{seg.duration:.1f}s{face_note}")
 
     if not parts:
         return None
@@ -110,9 +184,9 @@ def render_plan(storage: Storage, project: Project, plan: MontagePlan,
         plan.preview_path = str(out)
         plan.status = "rendered"
     storage.save_plan(plan)
-    # Временные сегменты больше не нужны — иначе каждый рендер оставляет
-    # сотни МБ в cache/render_* (утечка диска)
+    # concat-времянка не нужна; кэш сегментов живёт с LRU-лимитом
     shutil.rmtree(tmp_dir, ignore_errors=True)
+    _trim_segment_cache(seg_cache)
     progress(f"Рендер готов: {out}")
     return out
 

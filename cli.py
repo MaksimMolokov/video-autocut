@@ -101,7 +101,8 @@ def cmd_plan(args):
         print(f"  BPM {music.bpm}, битов {len(music.beats)}, кульминация {music.climax_time}s")
 
     scenes = storage.list_scenes(project.id)
-    plan = build_plan(project, scenes, music, use_llm=not args.no_llm)
+    plan = build_plan(project, scenes, music, use_llm=not args.no_llm,
+                      variant=args.variant)
     storage.save_plan(plan)
     project.status = "planned"
     storage.save_project(project)
@@ -174,6 +175,8 @@ def main():
     p.add_argument("--aspect", choices=["9:16", "16:9", "1:1"], default=None)
     p.add_argument("--music", default=None, help="путь к музыкальному файлу")
     p.add_argument("--no-llm", action="store_true", help="без LLM-ранжирования")
+    p.add_argument("--variant", type=int, default=0,
+                   help="номер варианта (0 — лучший, >0 — альтернативные сборки)")
     p.set_defaults(func=cmd_plan)
 
     r = sub.add_parser("render", help="собрать ролик по плану")

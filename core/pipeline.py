@@ -102,9 +102,13 @@ def analyze_project(storage: Storage, project: Project,
                 scene.thumbnail_path = str(thumb)
             if previews.make_preview_clip(str(f), start, end, clip):
                 scene.preview_path = str(clip)
-            # кадр для LLM кэшируем сразу — пригодится и при отложенном LLM-прогоне
+            # кадры для LLM кэшируем сразу — пригодятся и при отложенном прогоне;
+            # длинная сцена (≥12с) получает второй кадр: модель видит развитие
             frame = pdir / "cache" / f"{scene.id}_key.jpg"
             previews.extract_frame(str(f), key_t, frame)
+            if scene.duration >= 12 and len(q.keyframes) > 1:
+                frame2 = pdir / "cache" / f"{scene.id}_key2.jpg"
+                previews.extract_frame(str(f), q.keyframes[-1], frame2)
             all_scenes.append(scene)
 
         storage.save_scenes(all_scenes)
@@ -144,7 +148,11 @@ def run_llm_analysis(storage: Storage, project: Project,
                 scene.llm_status = "failed"
                 storage.save_scene(scene)
                 continue
-        if llm.fill_scene(scene, frame):
+        frames: list = [frame]
+        frame2 = pdir / "cache" / f"{scene.id}_key2.jpg"
+        if frame2.exists():
+            frames.append(frame2)
+        if llm.fill_scene(scene, frames):
             done += 1
             progress(f"  [{n}/{len(pending)}] {scene.scene_type or '?'} — "
                      f"{scene.description[:60]}…")

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 
 import config
 from core.audio_analyzer import MusicAnalysis
@@ -27,7 +28,10 @@ _ALTERNATIVES_PER_SLOT = 4  # сколько запасных сцен хран�
 
 def build_plan(project: Project, scenes: list[Scene],
                music: MusicAnalysis | None = None,
-               use_llm: bool = True) -> MontagePlan:
+               use_llm: bool = True, variant: int = 0) -> MontagePlan:
+    """variant=0 — детерминированный лучший план; variant>0 — «другой вариант»:
+    топ-кандидаты слотов перемешиваются воспроизводимо (тот же variant —
+    тот же план), закреплённые сцены всегда остаются первыми."""
     preset = get_preset(project.preset_id)
     scenario = project.scenario_text or preset.scenario_text()
 
@@ -62,6 +66,15 @@ def build_plan(project: Project, scenes: list[Scene],
         if not candidates:
             candidates = _rank_for_slot(usable, slot_spec, set())  # разрешаем повтор в крайнем случае
 
+        if variant and len(candidates) > 1:
+            # «Другой вариант»: перемешиваем топ слота воспроизводимо,
+            # pinned не выпадают из головы списка
+            rnd = random.Random(f"{variant}:{slot_spec.slot}")
+            top, rest = candidates[:6], candidates[6:]
+            rnd.shuffle(top)
+            top.sort(key=lambda c: c[0].user_flag != "pinned")
+            candidates = top + rest
+
         remaining = slot_duration
         slot_alternatives: list[str] = []
         for scene, score, reason in candidates:
@@ -88,7 +101,7 @@ def build_plan(project: Project, scenes: list[Scene],
             plan.segments.append(PlanSegment(
                 scene_id=scene.id, order=order,
                 src_start=src_start, src_end=src_end,
-                slot=slot_spec.slot, reason=reason, crop="center",
+                slot=slot_spec.slot, reason=reason, crop="smart",
             ))
             used_scene_ids.add(scene.id)
             used_video_run = scene.video_id
@@ -205,10 +218,19 @@ def _renumber(plan: MontagePlan):
 
 # --- LLM-ранжирование (ТЗ §8.4–8.6) ---
 
+_RANK_BATCH = 25  # карточек на один запрос: не упираемся в контекст при 100+ сценах
+
+
+def _chunks(items: list, size: int) -> list[list]:
+    return [items[i:i + size] for i in range(0, len(items), size)]
+
+
 def _llm_rank(scenario: str, scenes: list[Scene]) -> bool:
     """Просит LLM оценить соответствие карточек сцен сценарию (0..1).
 
     Работает с текстовыми карточками, а не с изображениями — быстрый запрос.
+    Карточки уходят батчами по _RANK_BATCH, чтобы большая библиотека
+    не упёрлась в контекст модели.
     При недоступности LM Studio молча пропускается (скоринг остаётся rule-based).
     """
     llm = LLMAnalyzer()
@@ -239,24 +261,28 @@ def _llm_rank(scenario: str, scenes: list[Scene]) -> bool:
             "required": ["scores"], "additionalProperties": False,
         },
     }
+    by_id: dict[str, float] = {}
     try:
-        resp = llm.client.chat.completions.create(
-            model=llm.model, temperature=0.1, max_tokens=3500,
-            response_format={"type": "json_schema", "json_schema": schema},
-            messages=[
-                {"role": "system", "content":
-                    "Ты — режиссёр монтажа. Оцени соответствие каждой сцены сценарию "
-                    "по шкале 0.0-1.0. Отвечай только JSON."},
-                {"role": "user", "content":
-                    f"Сценарий:\n{scenario}\n\nСцены:\n{json.dumps(cards, ensure_ascii=False)}"},
-            ],
-        )
-        data = json.loads(resp.choices[0].message.content)
-        by_id = {x["id"]: float(x["match"]) for x in data.get("scores", [])}
-        for s in scenes:
-            if s.id in by_id:
-                s.scenario_match_score = min(max(by_id[s.id], 0.0), 1.0)
-        return True
+        for batch in _chunks(cards, _RANK_BATCH):
+            resp = llm.client.chat.completions.create(
+                model=llm.model, temperature=0.1, max_tokens=3500,
+                response_format={"type": "json_schema", "json_schema": schema},
+                messages=[
+                    {"role": "system", "content":
+                        "Ты — режиссёр монтажа. Оцени соответствие каждой сцены сценарию "
+                        "по шкале 0.0-1.0. Отвечай только JSON."},
+                    {"role": "user", "content":
+                        f"Сценарий:\n{scenario}\n\nСцены:\n{json.dumps(batch, ensure_ascii=False)}"},
+                ],
+            )
+            data = json.loads(resp.choices[0].message.content)
+            for x in data.get("scores", []):
+                by_id[x["id"]] = float(x["match"])
     except Exception as e:
         log.warning("LLM-ранжирование не удалось (%s) — используется rule-based", e)
-        return False
+        if not by_id:
+            return False
+    for s in scenes:
+        if s.id in by_id:
+            s.scenario_match_score = min(max(by_id[s.id], 0.0), 1.0)
+    return True

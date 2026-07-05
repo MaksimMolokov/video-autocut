@@ -482,20 +482,31 @@ elif step == "draft":
     ready = [s for s in scenes if s.user_flag != "banned"]
     plan = storage.latest_plan(project.id)
 
+    def _rebuild(variant: int):
+        with st.spinner("Монтажный план…"):
+            music = None
+            if project.music_path and Path(project.music_path).exists():
+                music = analyze_music_cached(storage, project.music_path)
+            new_plan = build_plan(project, ready, music,
+                                  use_llm=use_llm_rank, variant=variant)
+            storage.save_plan(new_plan)
+        with st.spinner("Рендер preview…"):
+            render_plan(storage, project, new_plan, final=False, progress=lambda m: None)
+        st.rerun()
+
     cbtn, cvid = st.columns([1, 2])
     with cbtn:
         use_llm_rank = st.checkbox("LLM-ранжирование сцен", True)
         label = "🎬 Пересобрать черновик" if plan else "🎬 Сгенерировать черновик"
         if st.button(label, type="primary", use_container_width=True, disabled=not ready):
-            with st.spinner("Монтажный план…"):
-                music = None
-                if project.music_path and Path(project.music_path).exists():
-                    music = analyze_music_cached(storage, project.music_path)
-                plan = build_plan(project, ready, music, use_llm=use_llm_rank)
-                storage.save_plan(plan)
-            with st.spinner("Рендер preview…"):
-                render_plan(storage, project, plan, final=False, progress=lambda m: None)
-            st.rerun()
+            st.session_state["plan_variant"] = 0
+            _rebuild(0)
+        if plan and st.button("🎲 Другой вариант", use_container_width=True,
+                              disabled=not ready,
+                              help="Пересоберёт черновик из других сцен-кандидатов"):
+            v = st.session_state.get("plan_variant", 0) + 1
+            st.session_state["plan_variant"] = v
+            _rebuild(v)
         if plan and project.music_path:
             st.markdown(
                 f'<div class="ai-explain">Музыка: фрагмент с {plan.music_offset:.0f}s, '

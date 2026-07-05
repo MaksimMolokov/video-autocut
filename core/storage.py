@@ -130,6 +130,10 @@ class Storage:
             (v.id, v.project_id, v.path, json.dumps(asdict(v), ensure_ascii=False)),
         )
 
+    def get_video(self, video_id: str) -> SourceVideo | None:
+        rows = self._query("SELECT data FROM videos WHERE id=?", (video_id,))
+        return _load(SourceVideo, rows[0][0]) if rows else None
+
     def list_videos(self, project_id: str) -> list[SourceVideo]:
         rows = self._query("SELECT data FROM videos WHERE project_id=?", (project_id,))
         return [_load(SourceVideo, r[0]) for r in rows]

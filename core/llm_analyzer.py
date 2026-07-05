@@ -46,10 +46,15 @@ SCENE_SCHEMA = {
                      "description": "5-10 коротких тегов на английском: people, food, nature, building, interior, exterior, vehicle, closeup, wide-shot и т.п."},
             "usable_for_edit": {"type": "boolean",
                                 "description": "пригоден ли кадр для монтажа"},
+            "subject_x": {"type": "number", "minimum": 0, "maximum": 1,
+                          "description": "горизонтальная позиция главного объекта/людей: 0=левый край, 0.5=центр, 1=правый край"},
+            "subject_y": {"type": "number", "minimum": 0, "maximum": 1,
+                          "description": "вертикальная позиция главного объекта: 0=верх, 0.5=центр, 1=низ"},
         },
         "required": ["scene_description", "objects", "people_count", "emotions",
                      "composition", "lighting", "aesthetic_score", "scene_type",
-                     "recommended_slot", "tags", "usable_for_edit"],
+                     "recommended_slot", "tags", "usable_for_edit",
+                     "subject_x", "subject_y"],
         "additionalProperties": False,
     },
 }
@@ -129,9 +134,23 @@ class LLMAnalyzer:
                 return False
         return True
 
-    def analyze_frame(self, frame_path: Path) -> dict | None:
-        """Один кадр → структурированное описание. None при ошибке."""
-        img_b64 = base64.b64encode(frame_path.read_bytes()).decode()
+    def analyze_frame(self, frame_path: Path | list[Path]) -> dict | None:
+        """Кадр (или 2–3 кадра длинной сцены) → структурированное описание.
+
+        Несколько кадров уходят одним запросом — модель видит развитие сцены
+        (начало/конец) и описывает её целиком.
+        """
+        paths = [frame_path] if isinstance(frame_path, Path) else list(frame_path)
+        if len(paths) == 1:
+            text = "Проанализируй этот кадр из видео для каталога сцен."
+        else:
+            text = (f"Это {len(paths)} кадра ОДНОЙ сцены (от начала к концу). "
+                    "Опиши сцену целиком, учитывая её развитие.")
+        content: list[dict] = [{"type": "text", "text": text}]
+        for p in paths:
+            img_b64 = base64.b64encode(p.read_bytes()).decode()
+            content.append({"type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}})
         try:
             resp = self.client.chat.completions.create(
                 model=self.model,
@@ -140,24 +159,19 @@ class LLMAnalyzer:
                 response_format={"type": "json_schema", "json_schema": SCENE_SCHEMA},
                 messages=[
                     {"role": "system", "content": _SYSTEM_PROMPT},
-                    {"role": "user", "content": [
-                        {"type": "text",
-                         "text": "Проанализируй этот кадр из видео для каталога сцен."},
-                        {"type": "image_url",
-                         "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
-                    ]},
+                    {"role": "user", "content": content},
                 ],
             )
             data = _parse_json_lenient(resp.choices[0].message.content or "")
             if data is None:
                 log.warning("LLM-анализ кадра %s: невалидный JSON (finish=%s)",
-                            frame_path.name, resp.choices[0].finish_reason)
+                            paths[0].name, resp.choices[0].finish_reason)
             return data
         except Exception as e:
-            log.warning("LLM-анализ кадра %s не удался: %s", frame_path.name, e)
+            log.warning("LLM-анализ кадра %s не удался: %s", paths[0].name, e)
             return None
 
-    def fill_scene(self, scene: Scene, frame_path: Path) -> bool:
+    def fill_scene(self, scene: Scene, frame_path: Path | list[Path]) -> bool:
         """Заполняет смысловые поля карточки сцены. True при успехе."""
         data = self.analyze_frame(frame_path)
         if not data:
@@ -177,6 +191,8 @@ class LLMAnalyzer:
         scene.scene_type = data.get("scene_type", "")
         scene.recommended_slot = data.get("recommended_slot", "")
         scene.tags = data.get("tags", [])
+        scene.subject_x = float(min(max(data.get("subject_x", 0.5) or 0.5, 0), 1))
+        scene.subject_y = float(min(max(data.get("subject_y", 0.5) or 0.5, 0), 1))
         if not data.get("usable_for_edit", True):
             scene.tags.append("not-usable")
         scene.llm_status = "done"

@@ -155,6 +155,41 @@ def test_all_shaky_fallback_least_jerky():
     assert max(used_jerk) <= sorted(s.jerkiness for s in lib)[len(lib) // 2]
 
 
+def test_variant_changes_plan():
+    """variant>0 даёт другую сборку; тот же variant — воспроизводимую."""
+    lib = _library(n=15)
+    base = build_plan(_project(), lib, music=None, use_llm=False, variant=0)
+    v1a = build_plan(_project(), lib, music=None, use_llm=False, variant=1)
+    v1b = build_plan(_project(), lib, music=None, use_llm=False, variant=1)
+
+    def order(p):
+        return [s.scene_id for s in p.segments]
+
+    assert order(v1a) == order(v1b)          # воспроизводимость
+    assert order(v1a) != order(base)         # действительно другой вариант
+    # структура валидна: длительность в норме
+    assert 0.6 * 30 <= v1a.total_duration <= 30.5
+
+
+def test_variant_keeps_pinned():
+    """Перемешивание вариантов не выбрасывает закреплённые сцены."""
+    lib = _library()
+    pinned = _scene(video_id="v9", scene_type="establishing")
+    pinned.user_flag = "pinned"
+    lib.append(pinned)
+    for v in (1, 2, 3):
+        plan = build_plan(_project(), lib, music=None, use_llm=False, variant=v)
+        assert pinned.id in {s.scene_id for s in plan.segments}
+
+
+def test_llm_rank_chunks():
+    from core.montage_planner import _RANK_BATCH, _chunks
+    items = list(range(60))
+    chunks = _chunks(items, _RANK_BATCH)
+    assert [len(c) for c in chunks] == [25, 25, 10]
+    assert sum(chunks, []) == items
+
+
 def test_alternatives_stored():
     plan = build_plan(_project(), _library(), music=None, use_llm=False)
     assert isinstance(plan.alternatives, dict)

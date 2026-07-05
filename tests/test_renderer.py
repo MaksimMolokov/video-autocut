@@ -77,6 +77,35 @@ def test_render_empty_plan(storage, project_with_plan):
     assert render_plan(storage, project, plan, final=False, progress=lambda m: None) is None
 
 
+def test_segment_cache_reused(storage, project_with_plan):
+    """Повторный рендер не перекодирует сегменты — берёт из кэша."""
+    project, plan, _ = project_with_plan
+    render_plan(storage, project, plan, final=False, progress=lambda m: None)
+    seg_dir = storage.project_dir(project.id) / "cache" / "segments"
+    first = {p.name: p.stat().st_mtime_ns for p in seg_dir.glob("*.mp4")}
+    assert first  # кэш создан
+
+    messages = []
+    out = render_plan(storage, project, plan, final=False, progress=messages.append)
+    assert out and out.exists()
+    second = {p.name: p.stat().st_mtime_ns for p in seg_dir.glob("*.mp4")}
+    assert set(second) == set(first)                     # те же файлы
+    assert sum("из кэша" in m for m in messages) == len(plan.segments)
+
+
+def test_segment_cache_lru_trim(storage, project_with_plan, monkeypatch):
+    """При превышении лимита старейшие сегменты удаляются."""
+    from core import renderer as r
+    project, plan, _ = project_with_plan
+    render_plan(storage, project, plan, final=False, progress=lambda m: None)
+    seg_dir = storage.project_dir(project.id) / "cache" / "segments"
+    n_before = len(list(seg_dir.glob("*.mp4")))
+    assert n_before >= 2
+    monkeypatch.setattr(r, "_SEGMENT_CACHE_MAX_BYTES", 1)  # лимит 1 байт
+    r._trim_segment_cache(seg_dir)
+    assert len(list(seg_dir.glob("*.mp4"))) == 0
+
+
 def test_replace_segment(storage, project_with_plan):
     project, plan, alt = project_with_plan
     seg = plan.segments[1]

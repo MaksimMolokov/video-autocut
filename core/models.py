@@ -101,6 +101,8 @@ class Scene:
     composition: str = ""
     lighting: str = ""
     aesthetic_score: float = 0.0    # 0..1, «красота» от LLM
+    subject_x: float = 0.5          # позиция главного объекта (0..1) — умный кроп
+    subject_y: float = 0.5
     scene_type: str = ""            # из SCENE_TYPES
     recommended_slot: str = ""      # из STORY_SLOTS
     recommendation_reason: str = ""
