@@ -54,6 +54,31 @@ def test_json_serializable(analysis):
     assert data["bpm"] == analysis.bpm
 
 
+def test_music_cache_roundtrip(storage, synthetic_music):
+    """Второй вызов analyze_music_cached не гоняет librosa — читает из БД."""
+    from core import audio_analyzer
+    from core.audio_analyzer import analyze_music_cached
+
+    m1 = analyze_music_cached(storage, synthetic_music)
+
+    calls = []
+    orig = audio_analyzer.analyze_music
+
+    def spy(path):
+        calls.append(path)
+        return orig(path)
+
+    audio_analyzer.analyze_music = spy
+    try:
+        m2 = analyze_music_cached(storage, synthetic_music)
+    finally:
+        audio_analyzer.analyze_music = orig
+
+    assert calls == []                       # librosa не запускалась
+    assert m2.bpm == m1.bpm and m2.beats == m1.beats
+    assert m2.calm_ranges == m1.calm_ranges  # кортежи восстановлены из JSON
+
+
 def test_ranges_helper():
     arr = np.array([0.1, 0.1, 0.1, 0.9, 0.9, 0.1, 0.1, 0.1])
     calm = _ranges(arr, lambda v: v < 0.4)

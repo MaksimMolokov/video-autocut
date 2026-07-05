@@ -1,9 +1,22 @@
 """Media Import (ТЗ §4): файлы и папки → список видеофайлов."""
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import config
+
+
+def file_fingerprint(path: str | Path) -> str:
+    """Быстрый отпечаток файла без чтения целиком: размер + mtime +
+    md5 первых 64 КБ. Достаточно, чтобы понять «файл не менялся»."""
+    p = Path(path)
+    st = p.stat()
+    h = hashlib.md5()
+    h.update(f"{st.st_size}:{st.st_mtime_ns}".encode())
+    with open(p, "rb") as fh:
+        h.update(fh.read(65536))
+    return h.hexdigest()
 
 
 def collect_video_files(paths: list[str | Path]) -> list[Path]:

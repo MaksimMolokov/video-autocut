@@ -53,7 +53,12 @@ CREATE TABLE IF NOT EXISTS replacements (   -- история замен (ТЗ �
     new_scene_id TEXT NOT NULL,
     created_at REAL NOT NULL DEFAULT (unixepoch('subsec'))
 );
+CREATE TABLE IF NOT EXISTS music_cache (   -- кэш анализа музыки (ТЗ §16)
+    key TEXT PRIMARY KEY,                  -- путь + mtime + размер
+    data TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_scenes_project ON scenes(project_id);
+CREATE INDEX IF NOT EXISTS idx_scenes_video ON scenes(video_id);
 CREATE INDEX IF NOT EXISTS idx_videos_project ON videos(project_id);
 CREATE INDEX IF NOT EXISTS idx_plans_project ON plans(project_id);
 """
@@ -158,6 +163,25 @@ class Storage:
         scenes = [_load(Scene, r[0]) for r in rows]
         scenes.sort(key=lambda s: (s.video_path, s.start))
         return scenes
+
+    def delete_video(self, video_id: str):
+        """Удаляет запись видео вместе с его сценами (переанализ файла)."""
+        with self._lock:
+            self.conn.execute("DELETE FROM scenes WHERE video_id=?", (video_id,))
+            self.conn.execute("DELETE FROM videos WHERE id=?", (video_id,))
+            self.conn.commit()
+
+    def list_scenes_by_video(self, video_id: str) -> list[Scene]:
+        rows = self._query("SELECT data FROM scenes WHERE video_id=?", (video_id,))
+        return [_load(Scene, r[0]) for r in rows]
+
+    # --- Кэш анализа музыки ---
+    def get_music_cache(self, key: str) -> str | None:
+        rows = self._query("SELECT data FROM music_cache WHERE key=?", (key,))
+        return rows[0][0] if rows else None
+
+    def set_music_cache(self, key: str, data: str):
+        self._write("INSERT OR REPLACE INTO music_cache VALUES (?,?)", (key, data))
 
     # --- Plans ---
     def save_plan(self, plan: MontagePlan):

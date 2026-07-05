@@ -93,3 +93,20 @@ def test_replace_segment(storage, project_with_plan):
 def test_replace_segment_unknown_id(storage, project_with_plan):
     _, plan, alt = project_with_plan
     assert not replace_segment(storage, plan, "nonexistent", alt)
+
+
+def test_replace_segment_resyncs_beats(storage, project_with_plan):
+    """После замены с переданной музыкой план заново выровнен по битам."""
+    from core.audio_analyzer import MusicAnalysis
+
+    _, plan, alt = project_with_plan
+    seg = plan.segments[1]
+    # альтернатива длиной 2.0s → конец таймлайна 2.5 + 2.0 = 4.5s;
+    # точка склейки 4.6s — в допуске ±0.35
+    music = MusicAnalysis(path="x", duration=60.0,
+                          cut_points=[2.5, 4.6], beats=[2.5, 4.6])
+    assert replace_segment(storage, plan, seg.id, alt, music=music)
+    replaced = storage.get_plan(plan.id).segments[1]
+    assert replaced.beat_synced
+    # конец сегмента подтянут: 2.5 (конец первого) + длительность = 4.6
+    assert abs((2.5 + replaced.duration) - 4.6) < 0.01

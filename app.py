@@ -14,11 +14,11 @@ from pathlib import Path
 import streamlit as st
 
 import config
-from core.audio_analyzer import analyze_music
+from core.audio_analyzer import analyze_music_cached
 from core.media_import import collect_video_files
 from core.models import Project
 from core.montage_planner import build_plan
-from core.pipeline import analyze_project, run_llm_analysis
+from core.pipeline import run_llm_analysis
 from core.presets import PRESETS
 from core.renderer import render_plan, replace_segment
 from core.storage import Storage
@@ -339,15 +339,38 @@ elif step == "analysis":
 
     with_llm = st.checkbox("Смысловой анализ кадров (Qwen3-VL 8B через LM Studio)", True,
                            help="Нужен запущенный LM Studio. Можно дозаполнить позже.")
+
+    # ошибка последнего запуска воркера (статус сброшен, сообщение осталось)
+    if project.status != "analyzing" and project.analysis_progress.startswith("Ошибка"):
+        st.error(project.analysis_progress)
+
+    # ── Фоновый воркер: UI не блокируется, прогресс читается из БД ──
+    if project.status == "analyzing":
+        st.markdown(
+            f'<div class="ai-explain">Анализ идёт в фоне — вкладку можно '
+            f'закрывать, прогресс не потеряется.<br><b>'
+            f'{project.analysis_progress or "запуск…"}</b></div>',
+            unsafe_allow_html=True)
+        st.progress(min(len(storage.list_scenes(project.id)) % 100 / 100 + 0.05, 0.95))
+        import time
+        time.sleep(2)
+        st.rerun()
+
     cA, cB = st.columns(2)
     if cA.button("🔍 Запустить анализ видео", type="primary", use_container_width=True):
-        box = st.status("Анализ исходников…", expanded=True)
-        try:
-            analyze_project(storage, project, progress=box.write, run_llm=with_llm)
-            box.update(label="Анализ завершён", state="complete")
-            _go("scenes")
-        except Exception as e:
-            box.update(label=f"Ошибка: {e}", state="error")
+        import subprocess
+        import sys as _sys
+        cmd = [_sys.executable, "cli.py", "analyze-project", "--project", project.id]
+        if not with_llm:
+            cmd.append("--no-llm")
+        log_path = storage.project_dir(project.id) / "cache" / "worker.log"
+        with open(log_path, "ab") as logf:
+            subprocess.Popen(cmd, cwd=str(config.BASE_DIR),
+                             stdout=logf, stderr=logf, start_new_session=True)
+        project.status = "analyzing"
+        project.analysis_progress = "запуск воркера…"
+        storage.save_project(project)
+        st.rerun()
 
     pending = [s for s in scenes if s.llm_status in ("pending", "failed")]
     if pending and cB.button(f"🧠 Дозаполнить описания ({len(pending)})",
@@ -363,7 +386,7 @@ elif step == "analysis":
         st.markdown("### 🎵 Анализ музыки")
         if st.button("Проанализировать трек"):
             with st.spinner("Темп, биты, энергетика…"):
-                m = analyze_music(project.music_path)
+                m = analyze_music_cached(storage, project.music_path)
                 st.session_state["music_info"] = {
                     "bpm": m.bpm, "duration": m.duration,
                     "beats": len(m.beats), "climax": m.climax_time,
@@ -467,7 +490,7 @@ elif step == "draft":
             with st.spinner("Монтажный план…"):
                 music = None
                 if project.music_path and Path(project.music_path).exists():
-                    music = analyze_music(project.music_path)
+                    music = analyze_music_cached(storage, project.music_path)
                 plan = build_plan(project, ready, music, use_llm=use_llm_rank)
                 storage.save_plan(plan)
             with st.spinner("Рендер preview…"):
@@ -551,7 +574,10 @@ elif step == "draft":
                     i2.caption(f"{alt.scene_type} · q={alt.quality_score:.2f} · "
                                f"✨{alt.aesthetic_score:.2f}\n\n{alt.description[:80]}")
                     if i2.button("Заменить", key=f"rep_{seg.id}_{alt.id}"):
-                        replace_segment(storage, plan, seg.id, alt)
+                        music_for_sync = None
+                        if project.music_path and Path(project.music_path).exists():
+                            music_for_sync = analyze_music_cached(storage, project.music_path)
+                        replace_segment(storage, plan, seg.id, alt, music=music_for_sync)
                         with st.spinner("Пересборка preview…"):
                             render_plan(storage, project, plan, final=False,
                                         progress=lambda m: None)

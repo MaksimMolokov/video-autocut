@@ -26,7 +26,18 @@ ProgressCb = Callable[[str], None]
 
 def analyze_project(storage: Storage, project: Project,
                     progress: ProgressCb = print, run_llm: bool = True) -> list[Scene]:
-    """Полный анализ исходников проекта. Возвращает список сцен."""
+    """Полный анализ исходников проекта. Возвращает список сцен.
+
+    Каждое сообщение прогресса дублируется в project.analysis_progress —
+    фоновый воркер и UI видят один и тот же живой статус через БД.
+    """
+    user_progress = progress
+
+    def progress(msg: str):  # noqa: ANN001 — обёртка с побочным эффектом
+        user_progress(msg)
+        project.analysis_progress = msg
+        storage.save_project(project)
+
     project.status = "analyzing"
     storage.save_project(project)
     pdir = storage.project_dir(project.id)
@@ -37,11 +48,29 @@ def analyze_project(storage: Storage, project: Project,
         raise ValueError(f"Видеофайлы не найдены в: {project.source_paths}")
     progress(f"Найдено видеофайлов: {len(files)}")
 
+    # Кэш: файлы, уже проанализированные в этом проекте (по отпечатку),
+    # не пересчитываются — повторный запуск анализа почти мгновенный
+    existing = storage.list_videos(project.id)
+    known = {v.file_hash: v for v in existing if v.file_hash}
+
     all_scenes: list[Scene] = []
     for i, f in enumerate(files, 1):
+        fp = media_import.file_fingerprint(f)
+        cached = known.get(fp)
+        if cached and storage.list_scenes_by_video(cached.id):
+            progress(f"[{i}/{len(files)}] {f.name}: уже проанализирован — из кэша")
+            continue
+
+        # Файл изменился или анализируется заново — все старые записи этого
+        # пути удаляются, иначе сцены задваиваются
+        for old in existing:
+            if old.path == str(f):
+                storage.delete_video(old.id)
+
         progress(f"[{i}/{len(files)}] {f.name}: технический анализ…")
         # 2. Теханализ
         video = video_analyzer.probe_video(project.id, f)
+        video.file_hash = fp
         storage.save_video(video)
         if not video.valid:
             progress(f"  ⚠️ пропущен ({video.error})")
@@ -80,13 +109,15 @@ def analyze_project(storage: Storage, project: Project,
 
         storage.save_scenes(all_scenes)
 
-    progress(f"Каталог сцен: {len(all_scenes)} (после отсева брака)")
+    total = len(storage.list_scenes(project.id))
+    progress(f"Каталог сцен: {total} (новых {len(all_scenes)}, после отсева брака)")
 
     # 5. Смысловой анализ LLM
     if run_llm:
         run_llm_analysis(storage, project, progress)
 
     project.status = "analyzed"
+    project.analysis_progress = ""
     storage.save_project(project)
     return storage.list_scenes(project.id)
 

@@ -118,8 +118,12 @@ def render_plan(storage: Storage, project: Project, plan: MontagePlan,
 
 
 def replace_segment(storage: Storage, plan: MontagePlan, segment_id: str,
-                    new_scene: Scene) -> bool:
-    """Замена фрагмента (ТЗ §14): обновляет план и пишет историю."""
+                    new_scene: Scene, music=None) -> bool:
+    """Замена фрагмента (ТЗ §14): обновляет план и пишет историю.
+
+    Если передан анализ музыки — план заново выравнивается по битам
+    (иначе после замены склейки уезжают с музыки).
+    """
     for seg in plan.segments:
         if seg.id == segment_id:
             old_scene_id = seg.scene_id
@@ -130,6 +134,12 @@ def replace_segment(storage: Storage, plan: MontagePlan, segment_id: str,
             seg.src_end = round(seg.src_start + frag_len, 3)
             seg.reason = "заменено пользователем"
             seg.beat_synced = False
+            if music is not None:
+                # идемпотентно: уже выровненные сегменты остаются на битах,
+                # заменённый подтягивается к ближайшей точке склейки
+                from core.montage_planner import _snap_to_beats
+                from core.music_selector import shifted_cut_points
+                _snap_to_beats(plan, shifted_cut_points(music, plan.music_offset))
             storage.log_replacement(plan.id, seg.id, old_scene_id, new_scene.id)
             plan.status = "draft"
             storage.save_plan(plan)

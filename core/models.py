@@ -44,6 +44,7 @@ class Project:
     with_ending: bool = True
     sync_to_music: bool = True
     status: str = "new"        # new | analyzing | analyzed | planned | rendered
+    analysis_progress: str = ""  # живой статус фонового воркера для UI
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -65,6 +66,7 @@ class SourceVideo:
     codec: str = ""
     valid: bool = True         # файл читается и стабилен
     error: str = ""
+    file_hash: str = ""        # быстрый отпечаток файла — кэш анализа
 
 
 @dataclass

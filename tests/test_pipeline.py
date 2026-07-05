@@ -27,6 +27,53 @@ def test_analyze_project_e2e(storage, synthetic_video):
         assert (pdir / "cache" / f"{s.id}_key.jpg").exists()
 
 
+def test_reanalysis_uses_cache(storage, synthetic_video):
+    """Повторный анализ того же файла пропускается по file-hash: сцены
+    не дублируются, тяжёлая работа не повторяется."""
+    project = Project(name="cache", source_paths=[str(synthetic_video)])
+    storage.save_project(project)
+    first = analyze_project(storage, project, progress=lambda m: None, run_llm=False)
+
+    messages = []
+    second = analyze_project(storage, project, progress=messages.append, run_llm=False)
+    assert len(second) == len(first)                      # сцены не задвоились
+    assert any("из кэша" in m for m in messages)          # файл пропущен
+
+
+def test_reanalysis_without_hash_does_not_duplicate(storage, synthetic_video):
+    """Регрессия: записи видео без file_hash (старый формат) при переанализе
+    заменяются, а не задваиваются."""
+    project = Project(name="dedup", source_paths=[str(synthetic_video)])
+    storage.save_project(project)
+    first = analyze_project(storage, project, progress=lambda m: None, run_llm=False)
+
+    # имитируем записи старого формата — без отпечатка
+    for v in storage.list_videos(project.id):
+        v.file_hash = ""
+        storage.save_video(v)
+
+    second = analyze_project(storage, project, progress=lambda m: None, run_llm=False)
+    assert len(second) == len(first)                        # сцены не задвоились
+    assert len(storage.list_videos(project.id)) == 1        # одна запись на файл
+
+
+def test_analysis_progress_written_to_project(storage, synthetic_video):
+    """Прогресс анализа виден через БД (для фонового воркера и UI)."""
+    project = Project(name="progress", source_paths=[str(synthetic_video)])
+    storage.save_project(project)
+
+    seen_in_db = []
+
+    def spy(_msg):
+        p = storage.get_project(project.id)
+        seen_in_db.append((p.status, p.analysis_progress))
+
+    analyze_project(storage, project, progress=spy, run_llm=False)
+    assert any(s == "analyzing" and t for s, t in seen_in_db)
+    final = storage.get_project(project.id)
+    assert final.status == "analyzed" and final.analysis_progress == ""
+
+
 def test_analyze_project_no_files(storage, tmp_path):
     project = Project(name="пусто", source_paths=[str(tmp_path)])
     storage.save_project(project)

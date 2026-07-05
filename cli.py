@@ -42,6 +42,22 @@ def cmd_analyze(args):
     print(f"Каталог: python3 cli.py scenes --project {project.id}")
 
 
+def cmd_analyze_project(args):
+    """Фоновый воркер: анализ уже созданного проекта по сохранённым путям.
+    Запускается из UI через subprocess — прогресс пишется в БД."""
+    storage = Storage()
+    project = _resolve_project(storage, args.project)
+    if not project.source_paths:
+        sys.exit("У проекта нет исходников")
+    try:
+        analyze_project(storage, project, run_llm=not args.no_llm)
+    except Exception as e:  # статус ошибки должен дойти до UI
+        project.status = "new"
+        project.analysis_progress = f"Ошибка анализа: {e}"
+        storage.save_project(project)
+        raise
+
+
 def cmd_llm(args):
     storage = Storage()
     project = _resolve_project(storage, args.project)
@@ -79,9 +95,9 @@ def cmd_plan(args):
     from core.montage_planner import build_plan
     music = None
     if project.music_path:
-        from core.audio_analyzer import analyze_music
+        from core.audio_analyzer import analyze_music_cached
         print(f"Анализ музыки: {project.music_path}")
-        music = analyze_music(project.music_path)
+        music = analyze_music_cached(storage, project.music_path)
         print(f"  BPM {music.bpm}, битов {len(music.beats)}, кульминация {music.climax_time}s")
 
     scenes = storage.list_scenes(project.id)
@@ -137,6 +153,11 @@ def main():
     a.add_argument("--name", default="Без названия")
     a.add_argument("--no-llm", action="store_true", help="без смыслового LLM-анализа")
     a.set_defaults(func=cmd_analyze)
+
+    ap_ = sub.add_parser("analyze-project", help="анализ существующего проекта (фоновый воркер)")
+    ap_.add_argument("--project", required=True)
+    ap_.add_argument("--no-llm", action="store_true")
+    ap_.set_defaults(func=cmd_analyze_project)
 
     l = sub.add_parser("llm", help="дозаполнить LLM-описания сцен")
     l.add_argument("--project", default=None)

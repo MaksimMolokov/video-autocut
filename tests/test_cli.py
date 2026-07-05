@@ -29,6 +29,12 @@ def test_help():
         assert cmd in res.stdout
 
 
+def test_analyze_project_command_exists():
+    res = _run("analyze-project", "--project", "nonexistent-id")
+    assert res.returncode != 0  # проект не найден — честная ошибка, не крэш
+    assert "не найден" in (res.stdout + res.stderr)
+
+
 def test_unknown_command():
     res = _run("explode")
     assert res.returncode != 0

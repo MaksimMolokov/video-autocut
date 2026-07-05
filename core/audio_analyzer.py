@@ -87,6 +87,29 @@ def analyze_music(path: str | Path) -> MusicAnalysis:
     return result
 
 
+def analyze_music_cached(storage, path: str | Path) -> MusicAnalysis:
+    """Кэшированный анализ: librosa гоняется один раз на файл (путь+mtime+размер),
+    дальше результат читается из SQLite мгновенно."""
+    import json
+    from dataclasses import fields
+
+    p = Path(path)
+    st_ = p.stat()
+    key = f"{p.resolve()}:{st_.st_mtime_ns}:{st_.st_size}"
+    raw = storage.get_music_cache(key)
+    if raw:
+        data = json.loads(raw)
+        known = {f.name for f in fields(MusicAnalysis)}
+        m = MusicAnalysis(**{k: v for k, v in data.items() if k in known})
+        # JSON превращает кортежи в списки — возвращаем кортежи
+        m.calm_ranges = [tuple(r) for r in m.calm_ranges]
+        m.energetic_ranges = [tuple(r) for r in m.energetic_ranges]
+        return m
+    m = analyze_music(p)
+    storage.set_music_cache(key, m.to_json())
+    return m
+
+
 def _ranges(arr: np.ndarray, pred) -> list[tuple[float, float]]:
     """Непрерывные диапазоны секунд, где pred(value) истинно (длиной >= 2 сек)."""
     out, start = [], None
