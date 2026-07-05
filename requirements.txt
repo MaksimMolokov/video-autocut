@@ -1,0 +1,16 @@
+# Auto Video Editor V2 — зависимости
+# Анализ видео
+opencv-python>=4.9
+scenedetect>=0.6.4
+numpy>=1.26
+pillow>=10.0
+
+# LLM (LM Studio OpenAI-совместимый API)
+openai>=1.30
+
+# Анализ музыки (Фаза 5)
+librosa>=0.10
+soundfile>=0.12
+
+# UI (Фаза 4)
+streamlit>=1.35

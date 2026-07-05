@@ -1,0 +1,7 @@
+# Известный конфликт Streamlit×torch/тяжёлых библиотек — вотчер отключён
+[server]
+fileWatcherType = "none"
+maxUploadSize = 2048
+
+[browser]
+gatherUsageStats = false
