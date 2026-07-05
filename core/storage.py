@@ -115,6 +115,21 @@ class Storage:
             (p.id, p.name, p.status, p.created_at, json.dumps(asdict(p), ensure_ascii=False)),
         )
 
+    def delete_project(self, project_id: str):
+        """Полное удаление проекта: записи всех таблиц + файлы на диске."""
+        import shutil
+        with self._lock:
+            # история замен — до удаления планов (подзапрос по plans)
+            self.conn.execute(
+                "DELETE FROM replacements WHERE plan_id IN "
+                "(SELECT id FROM plans WHERE project_id=?)", (project_id,))
+            for table in ("scenes", "videos", "plans"):
+                self.conn.execute(f"DELETE FROM {table} WHERE project_id=?",  # noqa: S608 — имена фиксированы
+                                  (project_id,))
+            self.conn.execute("DELETE FROM projects WHERE id=?", (project_id,))
+            self.conn.commit()
+        shutil.rmtree(config.PROJECTS_DIR / project_id, ignore_errors=True)
+
     def get_project(self, project_id: str) -> Project | None:
         rows = self._query("SELECT data FROM projects WHERE id=?", (project_id,))
         return _load(Project, rows[0][0]) if rows else None

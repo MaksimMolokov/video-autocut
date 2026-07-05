@@ -41,15 +41,17 @@ def build_plan(project: Project, scenes: list[Scene],
 
     # Дёрганые сцены (тряска, смаз) исключаются из монтажа — кроме закреплённых.
     # Fallback: если стабильных сцен слишком мало, берём наименее дёрганые.
-    stable = [s for s in usable
-              if s.user_flag == "pinned"
-              or (s.motion_type != "shake"
-                  and s.stability_score >= config.STABILITY_MIN)]
-    if len(stable) >= 3:
-        usable = stable
-    else:
-        usable = sorted(usable, key=lambda s: s.jerkiness)[:max(len(usable) // 2, 3)]
-        log.warning("Стабильных сцен мало (%d) — взяты наименее дёрганые", len(usable))
+    # Опция stabilize_shaky: дёрганые остаются в пуле — рендер их стабилизирует.
+    if not project.stabilize_shaky:
+        stable = [s for s in usable
+                  if s.user_flag == "pinned"
+                  or (s.motion_type != "shake"
+                      and s.stability_score >= config.STABILITY_MIN)]
+        if len(stable) >= 3:
+            usable = stable
+        else:
+            usable = sorted(usable, key=lambda s: s.jerkiness)[:max(len(usable) // 2, 3)]
+            log.warning("Стабильных сцен мало (%d) — взяты наименее дёрганые", len(usable))
 
     # LLM-уточнение соответствия сценарию (если доступно)
     if use_llm:
@@ -113,6 +115,12 @@ def build_plan(project: Project, scenes: list[Scene],
             if frag_len < slot_spec.min_fragment:
                 continue
             src_start, src_end = _pick_fragment(scene, frag_len)
+            if scene.speech_segments:
+                # не резать посреди фразы (ТЗ §8, Whisper)
+                from core.speech_analyzer import adjust_for_speech
+                src_start, src_end = adjust_for_speech(
+                    src_start, src_end, scene.speech_segments,
+                    scene.start, scene.end, slot_spec.max_fragment)
             plan.segments.append(PlanSegment(
                 scene_id=scene.id, order=order,
                 src_start=src_start, src_end=src_end,

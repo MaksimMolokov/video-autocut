@@ -43,6 +43,11 @@ class Project:
     with_intro: bool = True
     with_ending: bool = True
     sync_to_music: bool = True
+    # Опция: стабилизировать дёрганые сцены вместо исключения (default ВЫКЛ —
+    # дёрганое просто не попадает в монтаж, материала обычно достаточно)
+    stabilize_shaky: bool = False
+    # Опция: анализ речи Whisper — не резать склейками посреди фразы
+    analyze_speech: bool = True
     status: str = "new"        # new | analyzing | analyzed | planned | rendered
     analysis_progress: str = ""  # живой статус фонового воркера для UI
 
@@ -67,6 +72,7 @@ class SourceVideo:
     valid: bool = True         # файл читается и стабилен
     error: str = ""
     file_hash: str = ""        # быстрый отпечаток файла — кэш анализа
+    speech_segments: list = field(default_factory=list)  # [[start, end, text], …]
 
 
 @dataclass
@@ -92,6 +98,7 @@ class Scene:
     motion_type: str = ""           # pan | zoom_in | zoom_out | flyover | rotate | shake | none
     jerkiness: float = 0.0          # 0..1 дёрганость камеры (1 = сильные рывки)
     best_moment: float = 0.0        # таймкод самого резкого кадра — центр фрагмента
+    speech_segments: list = field(default_factory=list)  # фразы внутри сцены [[s, e, text], …]
 
     # Смысловой анализ от LLM (ТЗ §7.5, §8; SPEC §5.1)
     description: str = ""

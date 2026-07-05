@@ -129,18 +129,51 @@ if "project_id" not in st.session_state:
             st.session_state["step"] = "material"
             st.rerun()
 
+    def _dir_size(path: Path) -> float:
+        """Размер папки в ГБ (быстро, без прав — 0)."""
+        try:
+            return sum(f.stat().st_size for f in path.rglob("*") if f.is_file()) / 1e9
+        except OSError:
+            return 0.0
+
     with col_open:
         st.markdown("### Открыть существующий")
         projects = storage.list_projects()
         if not projects:
             st.caption("Проектов пока нет")
-        for p in projects[:8]:
+        for p in projects[:20]:
             n_scenes = len(storage.list_scenes(p.id))
-            label = f"{p.name} · {p.status} · сцен: {n_scenes}"
-            if st.button(label, key=f"open_{p.id}", use_container_width=True):
+            pdir = config.PROJECTS_DIR / p.id
+            size_gb = _dir_size(pdir)
+            c_open, c_clean, c_del = st.columns([5, 1, 1])
+            label = f"{p.name} · {p.status} · сцен: {n_scenes} · {size_gb:.1f} ГБ"
+            if c_open.button(label, key=f"open_{p.id}", use_container_width=True):
                 st.session_state["project_id"] = p.id
                 st.session_state["step"] = _infer_step(p)
                 st.rerun()
+            if c_clean.button("🧹", key=f"clean_{p.id}",
+                              help="Очистить кэш (сегменты рендера и ключевые кадры — восстановимы)"):
+                from core import worker_lock as _wl
+                if _wl.is_running(pdir):
+                    st.warning("Идёт анализ — кэш не тронут")
+                else:
+                    import shutil
+                    cache_dir = pdir / "cache"
+                    if cache_dir.exists():
+                        shutil.rmtree(cache_dir, ignore_errors=True)
+                        cache_dir.mkdir(exist_ok=True)
+                    st.rerun()
+            confirm_key = f"confirm_del_{p.id}"
+            if st.session_state.get(confirm_key):
+                if c_del.button("❗️ Точно?", key=f"del2_{p.id}",
+                                help="Удалит проект, сцены, превью и рендеры БЕЗ ВОЗВРАТА"):
+                    storage.delete_project(p.id)
+                    st.session_state.pop(confirm_key, None)
+                    st.rerun()
+            else:
+                if c_del.button("🗑", key=f"del1_{p.id}", help="Удалить проект"):
+                    st.session_state[confirm_key] = True
+                    st.rerun()
     st.stop()
 
 project = _project()
@@ -312,6 +345,15 @@ elif step == "settings":
                                     if project.target_duration in (15, 30, 45, 60) else 30)
         sync = st.checkbox("Синхронизация склеек с битами музыки",
                            value=project.sync_to_music)
+        stab = st.checkbox("Стабилизировать дёрганые сцены вместо исключения",
+                           value=project.stabilize_shaky,
+                           help="По умолчанию дёрганое просто не попадает в монтаж. "
+                                "Включайте, когда материала мало и жалко терять сцены — "
+                                "ffmpeg выровняет тряску (рендер медленнее).")
+        speech = st.checkbox("Анализ речи (Whisper): не резать фразы склейками",
+                             value=project.analyze_speech,
+                             help="Для видео с голосом (семейные, интервью). "
+                                  "Видео без аудио пропускаются автоматически.")
 
     if st.button("Сохранить и перейти к анализу →", type="primary", use_container_width=True):
         project.preset_id = preset_id
@@ -319,6 +361,8 @@ elif step == "settings":
         project.aspect = aspect
         project.target_duration = duration
         project.sync_to_music = sync
+        project.stabilize_shaky = stab
+        project.analyze_speech = speech
         storage.save_project(project)
         _go("analysis")
 
@@ -345,7 +389,25 @@ elif step == "analysis":
         st.error(project.analysis_progress)
 
     # ── Фоновый воркер: UI не блокируется, прогресс читается из БД ──
-    if project.status == "analyzing":
+    from core import worker_lock
+    pdir = storage.project_dir(project.id)
+    worker_alive = worker_lock.is_running(pdir)
+
+    if project.status == "analyzing" and not worker_alive:
+        # воркер умер (краш/kill), а статус остался — честно сообщаем
+        st.error("Воркер анализа умер, не завершив работу. Последний статус: "
+                 f"«{project.analysis_progress}»")
+        log_path = pdir / "cache" / "worker.log"
+        if log_path.exists():
+            tail = log_path.read_text(errors="ignore").splitlines()[-15:]
+            with st.expander("Хвост лога воркера"):
+                st.code("\n".join(tail))
+        if st.button("Сбросить статус и продолжить"):
+            project.status = "new" if not storage.list_scenes(project.id) else "analyzed"
+            project.analysis_progress = ""
+            storage.save_project(project)
+            st.rerun()
+    elif project.status == "analyzing":
         st.markdown(
             f'<div class="ai-explain">Анализ идёт в фоне — вкладку можно '
             f'закрывать, прогресс не потеряется.<br><b>'
@@ -357,19 +419,23 @@ elif step == "analysis":
         st.rerun()
 
     cA, cB = st.columns(2)
-    if cA.button("🔍 Запустить анализ видео", type="primary", use_container_width=True):
+    if cA.button("🔍 Запустить анализ видео", type="primary", use_container_width=True,
+                 disabled=worker_alive,
+                 help="Анализ уже идёт" if worker_alive else None):
         import subprocess
         import sys as _sys
         cmd = [_sys.executable, "cli.py", "analyze-project", "--project", project.id]
         if not with_llm:
             cmd.append("--no-llm")
-        log_path = storage.project_dir(project.id) / "cache" / "worker.log"
+        log_path = pdir / "cache" / "worker.log"
         with open(log_path, "ab") as logf:
             subprocess.Popen(cmd, cwd=str(config.BASE_DIR),
                              stdout=logf, stderr=logf, start_new_session=True)
         project.status = "analyzing"
         project.analysis_progress = "запуск воркера…"
         storage.save_project(project)
+        import time
+        time.sleep(1)  # даём воркеру захватить lock до первого rerun
         st.rerun()
 
     pending = [s for s in scenes if s.llm_status in ("pending", "failed")]

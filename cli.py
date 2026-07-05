@@ -45,10 +45,15 @@ def cmd_analyze(args):
 def cmd_analyze_project(args):
     """Фоновый воркер: анализ уже созданного проекта по сохранённым путям.
     Запускается из UI через subprocess — прогресс пишется в БД."""
+    from core import worker_lock
+
     storage = Storage()
     project = _resolve_project(storage, args.project)
     if not project.source_paths:
         sys.exit("У проекта нет исходников")
+    pdir = storage.project_dir(project.id)
+    if not worker_lock.acquire(pdir):
+        sys.exit("Анализ этого проекта уже идёт — второй воркер не запущен")
     try:
         analyze_project(storage, project, run_llm=not args.no_llm)
     except Exception as e:  # статус ошибки должен дойти до UI
@@ -56,6 +61,8 @@ def cmd_analyze_project(args):
         project.analysis_progress = f"Ошибка анализа: {e}"
         storage.save_project(project)
         raise
+    finally:
+        worker_lock.release(pdir)
 
 
 def cmd_llm(args):

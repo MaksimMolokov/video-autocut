@@ -99,6 +99,32 @@ def test_schema_evolution_ignores_unknown_fields(storage):
     assert got.name == "x" and not hasattr(got, "legacy_field")
 
 
+def test_delete_project_removes_everything(storage):
+    """Удаление проекта чистит все таблицы и файлы на диске."""
+    p = Project(name="жертва")
+    storage.save_project(p)
+    storage.save_video(SourceVideo(project_id=p.id, path="/x.mp4"))
+    sc = Scene(project_id=p.id, video_id="v1", video_path="/x.mp4", start=0, end=3)
+    storage.save_scene(sc)
+    plan = MontagePlan(project_id=p.id)
+    storage.save_plan(plan)
+    storage.log_replacement(plan.id, "seg1", "old", "new")
+    pdir = storage.project_dir(p.id)
+    (pdir / "render" / "draft.mp4").write_bytes(b"data")
+
+    other = Project(name="сосед")
+    storage.save_project(other)
+
+    storage.delete_project(p.id)
+    assert storage.get_project(p.id) is None
+    assert storage.list_scenes(p.id) == []
+    assert storage.list_videos(p.id) == []
+    assert storage.latest_plan(p.id) is None
+    assert storage.conn.execute("SELECT COUNT(*) FROM replacements").fetchone()[0] == 0
+    assert not pdir.exists()
+    assert storage.get_project(other.id) is not None  # сосед не пострадал
+
+
 def test_threaded_access_like_streamlit(storage):
     """Регрессия: Streamlit дергает одно соединение из разных потоков.
     sqlite3.ProgrammingError 'objects created in a thread…' не должно быть."""

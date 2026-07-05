@@ -71,10 +71,21 @@ def analyze_project(storage: Storage, project: Project,
         # 2. Теханализ
         video = video_analyzer.probe_video(project.id, f)
         video.file_hash = fp
-        storage.save_video(video)
         if not video.valid:
+            storage.save_video(video)
             progress(f"  ⚠️ пропущен ({video.error})")
             continue
+
+        # 2.5 Речь (ТЗ §8): фразы с таймкодами — склейки не будут резать их
+        if project.analyze_speech and video.has_audio:
+            from core import speech_analyzer
+            if speech_analyzer.available():
+                progress("  распознавание речи (Whisper)…")
+                phrases = speech_analyzer.transcribe_video(f)
+                if phrases:
+                    video.speech_segments = [list(p) for p in phrases]
+                    progress(f"  найдено фраз: {len(phrases)}")
+        storage.save_video(video)
 
         # 3. Детекция сцен
         progress(f"  детекция сцен ({video.duration:.1f}s)…")
@@ -93,6 +104,9 @@ def analyze_project(storage: Storage, project: Project,
                 sharpness=q.sharpness, brightness=q.brightness,
                 motion=q.motion, motion_type=q.motion_type, jerkiness=q.jerkiness,
                 best_moment=q.keyframes[0],
+                # фразы, пересекающие сцену — для аккуратных склеек
+                speech_segments=[p for p in video.speech_segments
+                                 if p[1] > start and p[0] < end],
             )
             if q.motion_type == "shake":
                 scene.tags.append("jerky")  # дёрганая камера — маркер для каталога

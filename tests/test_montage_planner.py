@@ -142,6 +142,36 @@ def test_pinned_shaky_scene_still_allowed():
     assert shaky.id in used
 
 
+def test_stabilize_option_keeps_shaky_scenes():
+    """stabilize_shaky=True: дёрганые сцены остаются в пуле планировщика."""
+    lib = _library(n=4, videos=("v1", "v2"))
+    shaky = _scene(video_id="v9", scene_type="establishing",
+                   quality=0.9, aesthetic=0.9, stability=0.2)
+    shaky.motion_type = "shake"
+    shaky.jerkiness = 0.8
+    lib.append(shaky)
+    # выкл (default) — исключена
+    plan_off = build_plan(_project(), lib, music=None, use_llm=False)
+    assert shaky.id not in {s.scene_id for s in plan_off.segments}
+    # вкл — участвует и берётся (качество у неё выше всех)
+    plan_on = build_plan(_project(stabilize_shaky=True), lib,
+                         music=None, use_llm=False)
+    assert shaky.id in {s.scene_id for s in plan_on.segments}
+
+
+def test_speech_segments_adjust_fragment():
+    """Фрагмент сцены с речью сдвигается, чтобы не резать фразу."""
+    s = _scene(start=0.0, end=20.0)
+    s.best_moment = 10.0
+    s.speech_segments = [[8.5, 12.5, "важная фраза до конца"]]
+    plan = build_plan(_project(), [s] + _library(n=6), music=None, use_llm=False)
+    for seg in plan.segments:
+        if seg.scene_id == s.id:
+            # границы фрагмента не внутри фразы
+            for edge in (seg.src_start, seg.src_end):
+                assert not (8.5 < edge < 12.5), f"склейка режет фразу: {edge}"
+
+
 def test_all_shaky_fallback_least_jerky():
     """Если ВСЁ дёрганое — план всё равно собирается из наименее дёрганых."""
     lib = _library(n=8, videos=("v1", "v2"))

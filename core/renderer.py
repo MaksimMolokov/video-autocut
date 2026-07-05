@@ -64,6 +64,21 @@ def _segment_focus(scene: Scene, seg) -> tuple[float, float] | None:
     return None
 
 
+_STAB_FILTER = None  # определяется один раз: vidstab (лучше) или deshake
+
+
+def _stab_filter() -> str:
+    """Доступный фильтр стабилизации ffmpeg. vidstab требует libvidstab,
+    deshake есть везде."""
+    global _STAB_FILTER
+    if _STAB_FILTER is None:
+        res = subprocess.run(["ffmpeg", "-hide_banner", "-filters"],
+                             capture_output=True, text=True)
+        _STAB_FILTER = ("vidstabtransform" if "vidstabtransform" in res.stdout
+                        else "deshake")
+    return _STAB_FILTER
+
+
 def _trim_segment_cache(cache_dir: Path):
     """LRU: старейшие сегменты удаляются при превышении лимита."""
     files = sorted(cache_dir.glob("*.mp4"), key=lambda p: p.stat().st_mtime)
@@ -103,10 +118,13 @@ def render_plan(storage: Storage, project: Project, plan: MontagePlan,
         src_w, src_h = _display_dims(storage, scene)
         focus = _segment_focus(scene, seg)
         cw, ch, x, y = crop_window(src_w, src_h, w, h, focus)
+        # Опция: стабилизация дёрганой сцены вместо исключения из монтажа
+        stab = (project.stabilize_shaky and scene.motion_type == "shake")
 
         key = hashlib.md5(
             f"{seg.scene_id}:{seg.src_start:.3f}:{seg.src_end:.3f}:"
-            f"{w}x{h}:{'f' if final else 'p'}:{cw}x{ch}+{x}+{y}".encode()
+            f"{w}x{h}:{'f' if final else 'p'}:{cw}x{ch}+{x}+{y}"
+            f"{':stab' if stab else ''}".encode()
         ).hexdigest()[:16]
         part = seg_cache / f"{key}.mp4"
 
@@ -117,7 +135,24 @@ def render_plan(storage: Storage, project: Project, plan: MontagePlan,
             progress(f"  сегмент {seg.order + 1}/{len(plan.segments)} [{seg.slot}] из кэша")
             continue
 
-        vf = f"crop={cw}:{ch}:{x}:{y},scale={w}:{h},setsar=1,fps=30"
+        vf = f"crop={cw}:{ch}:{x}:{y},scale={w}:{h}"
+        if stab:
+            # стабилизация после приведения к целевому размеру + zoom ~5%,
+            # прячущий «гуляющие» края, и возврат к точному разрешению
+            zw, zh = int(w * 0.95) // 2 * 2, int(h * 0.95) // 2 * 2
+            if _stab_filter() == "vidstabtransform":
+                trf = seg_cache / f"{key}.trf"
+                subprocess.run(
+                    ["ffmpeg", "-y", "-v", "error",
+                     "-ss", f"{seg.src_start:.3f}", "-i", scene.video_path,
+                     "-t", f"{seg.duration:.3f}",
+                     "-vf", f"crop={cw}:{ch}:{x}:{y},scale={w}:{h},"
+                            f"vidstabdetect=result={trf}", "-f", "null", "-"],
+                    capture_output=True, text=True, timeout=600)
+                vf += f",vidstabtransform=input={trf}:zoom=5:smoothing=25"
+            else:
+                vf += f",deshake=rx=32:ry=32,crop={zw}:{zh},scale={w}:{h}"
+        vf += ",setsar=1,fps=30"
         cmd = [
             "ffmpeg", "-y", "-v", "error",
             "-ss", f"{seg.src_start:.3f}", "-i", scene.video_path,
@@ -133,8 +168,9 @@ def render_plan(storage: Storage, project: Project, plan: MontagePlan,
         parts.append(part)
         part_durs.append(seg.duration)
         face_note = " 👤" if focus else ""
+        stab_note = " 🩹" if stab else ""
         progress(f"  сегмент {seg.order + 1}/{len(plan.segments)} [{seg.slot}] "
-                 f"{seg.duration:.1f}s{face_note}")
+                 f"{seg.duration:.1f}s{face_note}{stab_note}")
 
     if not parts:
         return None
