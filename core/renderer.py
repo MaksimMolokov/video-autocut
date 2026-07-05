@@ -93,6 +93,7 @@ def render_plan(storage: Storage, project: Project, plan: MontagePlan,
 
     # 1. Нарезка сегментов: умный кроп + пофрагментный кэш
     parts: list[Path] = []
+    part_durs: list[float] = []
     for seg in plan.segments:
         scene = storage.get_scene(seg.scene_id)
         if not scene:
@@ -112,6 +113,7 @@ def render_plan(storage: Storage, project: Project, plan: MontagePlan,
         if part.exists():
             part.touch()  # обновляем mtime для LRU
             parts.append(part)
+            part_durs.append(seg.duration)
             progress(f"  сегмент {seg.order + 1}/{len(plan.segments)} [{seg.slot}] из кэша")
             continue
 
@@ -129,6 +131,7 @@ def render_plan(storage: Storage, project: Project, plan: MontagePlan,
             progress(f"  ⚠️ сегмент {seg.order + 1} пропущен (ошибка ffmpeg) — ролик будет короче")
             continue
         parts.append(part)
+        part_durs.append(seg.duration)
         face_note = " 👤" if focus else ""
         progress(f"  сегмент {seg.order + 1}/{len(plan.segments)} [{seg.slot}] "
                  f"{seg.duration:.1f}s{face_note}")
@@ -136,17 +139,40 @@ def render_plan(storage: Storage, project: Project, plan: MontagePlan,
     if not parts:
         return None
 
-    # 2. Конкатенация
-    concat_list = tmp_dir / "concat.txt"
-    concat_list.write_text("".join(f"file '{p}'\n" for p in parts))
+    # 2. Сборка: crossfade-цепочка (xfade) или жёсткая конкатенация
     silent = tmp_dir / "video.mp4"
-    res = subprocess.run(
-        ["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0",
-         "-i", str(concat_list), "-c", "copy", str(silent)],
-        capture_output=True, text=True, timeout=600,
-    )
+    fade_d = plan.transition_duration
+    use_xfade = plan.transition == "crossfade" and fade_d > 0 and len(parts) > 1
+    if use_xfade:
+        progress(f"  склейка crossfade {fade_d:.1f}s…")
+        inputs: list[str] = []
+        for p in parts:
+            inputs += ["-i", str(p)]
+        filters, prev, offset = [], "[0:v]", 0.0
+        for k in range(1, len(parts)):
+            offset += part_durs[k - 1] - fade_d
+            outlbl = f"[v{k}]"
+            filters.append(f"{prev}[{k}:v]xfade=transition=fade:"
+                           f"duration={fade_d:.3f}:offset={offset:.3f}{outlbl}")
+            prev = outlbl
+        res = subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", *inputs,
+             "-filter_complex", ";".join(filters), "-map", prev,
+             "-c:v", "libx264", *quality, "-movflags", "+faststart", str(silent)],
+            capture_output=True, text=True, timeout=900,
+        )
+        rendered_total = sum(part_durs) - (len(parts) - 1) * fade_d
+    else:
+        concat_list = tmp_dir / "concat.txt"
+        concat_list.write_text("".join(f"file '{p}'\n" for p in parts))
+        res = subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0",
+             "-i", str(concat_list), "-c", "copy", str(silent)],
+            capture_output=True, text=True, timeout=600,
+        )
+        rendered_total = sum(part_durs)
     if res.returncode != 0:
-        log.error("Конкатенация не удалась: %s", res.stderr[:300])
+        log.error("Сборка не удалась: %s", res.stderr[:300])
         return None
 
     # 3. Музыка: подобранный фрагмент трека (offset из плана) + фейды,
@@ -154,7 +180,7 @@ def render_plan(storage: Storage, project: Project, plan: MontagePlan,
     suffix = "final" if final else "preview"
     out = out_dir / f"{plan.id}_{suffix}.mp4"
     if project.music_path and Path(project.music_path).exists():
-        total = plan.total_duration
+        total = rendered_total  # фактическая длительность (учтён crossfade)
         f_in = max(plan.music_fade_in, 0.01)
         f_out = max(plan.music_fade_out, 0.01)
         fade_start = max(total - f_out, 0)
@@ -213,7 +239,8 @@ def replace_segment(storage: Storage, plan: MontagePlan, segment_id: str,
                 # заменённый подтягивается к ближайшей точке склейки
                 from core.montage_planner import _snap_to_beats
                 from core.music_selector import shifted_cut_points
-                _snap_to_beats(plan, shifted_cut_points(music, plan.music_offset))
+                _snap_to_beats(plan, shifted_cut_points(music, plan.music_offset),
+                               overlap=plan.transition_duration)
             storage.log_replacement(plan.id, seg.id, old_scene_id, new_scene.id)
             plan.status = "draft"
             storage.save_plan(plan)

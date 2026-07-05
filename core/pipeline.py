@@ -92,6 +92,7 @@ def analyze_project(storage: Storage, project: Project,
                 quality_score=q.quality_score, stability_score=q.stability_score,
                 sharpness=q.sharpness, brightness=q.brightness,
                 motion=q.motion, motion_type=q.motion_type, jerkiness=q.jerkiness,
+                best_moment=q.keyframes[0],
             )
             if q.motion_type == "shake":
                 scene.tags.append("jerky")  # дёрганая камера — маркер для каталога

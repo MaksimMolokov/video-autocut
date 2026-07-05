@@ -45,6 +45,19 @@ def test_even_dimensions():
     assert cw % 2 == 0 and ch % 2 == 0
 
 
+def test_crop_rect_norm():
+    """Нормированный прямоугольник для превью кадрирования (ТЗ §17.5)."""
+    from core.smart_crop import crop_rect_norm
+    x0, y0, x1, y1 = crop_rect_norm(1920, 1080, 1080, 1920)  # 16:9 → 9:16
+    assert 0 <= x0 < x1 <= 1 and (y0, y1) == (0.0, 1.0)
+    # аспект окна соответствует цели
+    w, h = (x1 - x0) * 1920, (y1 - y0) * 1080
+    assert abs(w / h - 1080 / 1920) < 0.01
+    # фокус слева сдвигает окно
+    fx0, _, fx1, _ = crop_rect_norm(1920, 1080, 1080, 1920, focus=(0.2, 0.5))
+    assert fx0 < x0
+
+
 def test_find_focus_no_faces(synthetic_video):
     """На синтетике лиц нет → None → рендер падёт в центральный кроп."""
     assert find_focus(str(synthetic_video), 0.5, 2.5) is None

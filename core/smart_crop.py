@@ -57,6 +57,16 @@ def crop_window(src_w: int, src_h: int, target_w: int, target_h: int,
     return cw - cw % 2, ch - ch % 2, x, y
 
 
+def crop_rect_norm(src_w: int, src_h: int, target_w: int, target_h: int,
+                   focus: tuple[float, float] | None = None
+                   ) -> tuple[float, float, float, float]:
+    """Нормированный (0..1) прямоугольник окна кропа (x0, y0, x1, y1) —
+    для отрисовки рамки предпросмотра кадрирования (ТЗ §17.5)."""
+    cw, ch, x, y = crop_window(src_w, src_h, target_w, target_h, focus)
+    return (round(x / src_w, 4), round(y / src_h, 4),
+            round((x + cw) / src_w, 4), round((y + ch) / src_h, 4))
+
+
 def find_focus(video_path: str, start: float, end: float,
                n_samples: int = 3) -> tuple[float, float] | None:
     """Взвешенный центр лиц на кадрах сегмента; None, если лиц нет."""

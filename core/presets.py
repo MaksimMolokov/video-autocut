@@ -30,6 +30,8 @@ class Preset:
     intro_rule: str = "спокойный или общий кадр, задающий место действия"
     ending_rule: str = "завершённый кадр: общий вид или спокойный фрагмент, без обрыва"
     sync_to_music: bool = True
+    transition: str = "cut"            # cut | crossfade — тип склейки
+    transition_duration: float = 0.4   # длительность перехода, сек
 
     def scenario_text(self) -> str:
         """Текст сценария для LLM-ранжировщика."""
@@ -59,7 +61,7 @@ PRESETS: dict[str, Preset] = {p.id: p for p in [
         ),
     ),
     Preset(
-        id="restaurant", title="Реклама ресторана/кафе", dynamics="medium",
+        id="restaurant", title="Реклама ресторана/кафе", dynamics="medium", transition="crossfade", transition_duration=0.4,
         idea="Аппетитная реклама заведения: атмосфера, интерьер, блюда крупным планом, довольные гости.",
         slots=_slots(
             ("intro", 0.15, ["establishing", "location"], 2.0, 5.0, ["slow", "static"]),
@@ -70,7 +72,7 @@ PRESETS: dict[str, Preset] = {p.id: p for p in [
         ),
     ),
     Preset(
-        id="coworking", title="Реклама коворкинга", dynamics="medium",
+        id="coworking", title="Реклама коворкинга", dynamics="medium", transition="crossfade", transition_duration=0.4,
         idea="Современное рабочее пространство: свет, зоны, атмосфера продуктивности, люди за работой.",
         slots=_slots(
             ("intro", 0.15, ["establishing", "location"], 2.0, 5.0, ["slow"]),
@@ -81,7 +83,7 @@ PRESETS: dict[str, Preset] = {p.id: p for p in [
         ),
     ),
     Preset(
-        id="travel", title="Туристический ролик", dynamics="medium",
+        id="travel", title="Туристический ролик", dynamics="medium", transition="crossfade", transition_duration=0.4,
         idea="Путешествие: пейзажи, достопримечательности, атмосфера места, ощущение открытия.",
         slots=_slots(
             ("intro", 0.15, ["establishing", "location"], 2.0, 5.0, ["slow"]),
@@ -92,7 +94,7 @@ PRESETS: dict[str, Preset] = {p.id: p for p in [
         ),
     ),
     Preset(
-        id="family", title="Семейное видео", dynamics="low",
+        id="family", title="Семейное видео", dynamics="low", transition="crossfade", transition_duration=0.5,
         idea="Тёплое семейное видео: эмоции, лица, совместные моменты, естественность.",
         slots=_slots(
             ("intro", 0.15, ["establishing", "people"], 2.0, 5.0, ["static", "slow"]),
@@ -103,7 +105,7 @@ PRESETS: dict[str, Preset] = {p.id: p for p in [
         ),
     ),
     Preset(
-        id="birthday", title="День рождения", dynamics="medium",
+        id="birthday", title="День рождения", dynamics="medium", transition="crossfade", transition_duration=0.3,
         idea="Праздник: торт, свечи, поздравления, эмоции именинника и гостей, веселье.",
         slots=_slots(
             ("intro", 0.15, ["establishing", "detail"], 2.0, 4.0, ["slow", "static"]),
@@ -114,7 +116,7 @@ PRESETS: dict[str, Preset] = {p.id: p for p in [
         ),
     ),
     Preset(
-        id="drone_cinematic", title="Дроновое cinematic video", dynamics="medium",
+        id="drone_cinematic", title="Дроновое cinematic video", dynamics="medium", transition="crossfade", transition_duration=0.4,
         idea="Кинематографичные дроновые кадры: масштаб, плавные пролёты, величие пейзажа.",
         slots=_slots(
             ("intro", 0.15, ["establishing"], 2.5, 6.0, ["slow"]),
@@ -149,7 +151,7 @@ PRESETS: dict[str, Preset] = {p.id: p for p in [
         intro_rule="мгновенный хук: движение или самый яркий кадр",
     ),
     Preset(
-        id="real_estate", title="Презентация недвижимости", dynamics="low",
+        id="real_estate", title="Презентация недвижимости", dynamics="low", transition="crossfade", transition_duration=0.5,
         idea="Презентация объекта: фасад, входная группа, ключевые помещения, детали отделки, вид из окон.",
         slots=_slots(
             ("intro", 0.15, ["establishing"], 2.5, 6.0, ["slow", "static"]),
@@ -160,7 +162,7 @@ PRESETS: dict[str, Preset] = {p.id: p for p in [
         ),
     ),
     Preset(
-        id="slow_cinematic", title="Атмосферный slow cinematic", dynamics="low",
+        id="slow_cinematic", title="Атмосферный slow cinematic", dynamics="low", transition="crossfade", transition_duration=0.6,
         idea="Медитативный атмосферный ролик: длинные планы, настроение, свет, фактуры, неторопливость.",
         slots=_slots(
             ("intro", 0.15, ["establishing"], 3.0, 7.0, ["static", "slow"]),
@@ -183,7 +185,7 @@ PRESETS: dict[str, Preset] = {p.id: p for p in [
         ),
     ),
     Preset(
-        id="generic", title="Универсальный ролик", dynamics="medium",
+        id="generic", title="Универсальный ролик", dynamics="medium", transition="crossfade", transition_duration=0.3,
         idea="Сбалансированный ролик: понятное начало, содержательная середина, яркая кульминация, завершённый финал.",
         slots=_slots(
             ("intro", 0.15, ["establishing", "intro", "location"], 1.5, 5.0, ["slow", "static"]),

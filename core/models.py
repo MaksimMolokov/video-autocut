@@ -91,6 +91,7 @@ class Scene:
     motion: str = ""                # static | slow | fast
     motion_type: str = ""           # pan | zoom_in | zoom_out | flyover | rotate | shake | none
     jerkiness: float = 0.0          # 0..1 дёрганость камеры (1 = сильные рывки)
+    best_moment: float = 0.0        # таймкод самого резкого кадра — центр фрагмента
 
     # Смысловой анализ от LLM (ТЗ §7.5, §8; SPEC §5.1)
     description: str = ""
@@ -163,6 +164,9 @@ class MontagePlan:
     music_offset: float = 0.0
     music_fade_in: float = 1.0
     music_fade_out: float = 1.5
+    # Переход между сценами (из пресета)
+    transition: str = "cut"            # cut | crossfade
+    transition_duration: float = 0.0
     status: str = "draft"      # draft | rendered | final
     preview_path: str = ""
     export_path: str = ""

@@ -155,6 +155,78 @@ def test_all_shaky_fallback_least_jerky():
     assert max(used_jerk) <= sorted(s.jerkiness for s in lib)[len(lib) // 2]
 
 
+def test_similar_scenes_same_video_adjacent():
+    from core.montage_planner import _similar_scenes
+    a = _scene(video_id="v1", start=0, end=8)
+    b = _scene(video_id="v1", start=10, end=18)   # соседний кусок пролёта
+    c = _scene(video_id="v1", start=100, end=108)  # далеко — другой эпизод
+    assert _similar_scenes(a, b, {})
+    assert not _similar_scenes(a, c, {})
+
+
+def test_similar_scenes_by_tags():
+    from core.montage_planner import _similar_scenes
+    a = _scene(video_id="v1", start=0, end=8, scene_type="action")
+    b = _scene(video_id="v2", start=0, end=8, scene_type="action")
+    a.tags = ["beach", "people", "running"]; a.objects = ["men", "sand"]
+    b.tags = ["beach", "people", "running"]; b.objects = ["men", "sand"]
+    assert _similar_scenes(a, b, {})               # нет миниатюр → доверяем тегам
+    b.tags = ["city", "night"]; b.objects = ["car"]
+    assert not _similar_scenes(a, b, {})
+
+
+def test_plan_avoids_duplicate_looking_scenes():
+    """Две почти одинаковые сцены не попадают в один ролик, пока есть выбор."""
+    lib = _library(n=10)
+    twin_a = _scene(video_id="v7", start=0, end=8, scene_type="action",
+                    quality=0.95, aesthetic=0.95)
+    twin_b = _scene(video_id="v8", start=0, end=8, scene_type="action",
+                    quality=0.95, aesthetic=0.95)
+    for t in (twin_a, twin_b):
+        t.tags = ["beach", "running", "people"]
+        t.objects = ["two-men", "sand", "waves"]
+    lib += [twin_a, twin_b]
+    plan = build_plan(_project(), lib, music=None, use_llm=False)
+    used = {s.scene_id for s in plan.segments}
+    assert not ({twin_a.id, twin_b.id} <= used)   # обе сразу — никогда
+
+
+def test_pick_fragment_centers_on_best_moment():
+    s = _scene(start=10.0, end=20.0)
+    s.best_moment = 12.0
+    start, end = _pick_fragment(s, 4.0)
+    assert start <= 12.0 <= end                   # лучший момент внутри окна
+    assert (start, end) == (10.0, 14.0)           # окно прижато к границе
+
+
+def test_pick_fragment_best_moment_fallback():
+    s = _scene(start=10.0, end=20.0)              # best_moment=0 → середина
+    start, end = _pick_fragment(s, 4.0)
+    assert (start, end) == (13.0, 17.0)
+
+
+def test_plan_carries_transition_from_preset():
+    plan = build_plan(_project(preset_id="slow_cinematic"), _library(),
+                      music=None, use_llm=False)
+    assert plan.transition == "crossfade" and plan.transition_duration == 0.6
+    plan2 = build_plan(_project(preset_id="tiktok_clip"), _library(),
+                       music=None, use_llm=False)
+    assert plan2.transition == "cut" and plan2.transition_duration == 0.0
+
+
+def test_snap_to_beats_with_overlap():
+    """При crossfade середина перехода (а не жёсткий стык) ложится на бит."""
+    from core.models import MontagePlan, PlanSegment
+    plan = MontagePlan(project_id="p", segments=[
+        PlanSegment(scene_id="a", order=0, src_start=0.0, src_end=4.0, slot="intro"),
+        PlanSegment(scene_id="b", order=1, src_start=0.0, src_end=4.0, slot="main"),
+    ])
+    # overlap 0.4 → видимая склейка на 4.0-0.2=3.8; бит на 4.0 → delta 0.2
+    _snap_to_beats(plan, [4.0], overlap=0.4)
+    assert plan.segments[0].beat_synced
+    assert abs(plan.segments[0].duration - 4.2) < 0.01
+
+
 def test_variant_changes_plan():
     """variant>0 даёт другую сборку; тот же variant — воспроизводимую."""
     lib = _library(n=15)

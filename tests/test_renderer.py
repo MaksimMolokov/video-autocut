@@ -77,6 +77,20 @@ def test_render_empty_plan(storage, project_with_plan):
     assert render_plan(storage, project, plan, final=False, progress=lambda m: None) is None
 
 
+def test_crossfade_render_duration(storage, project_with_plan):
+    """Crossfade: длительность ролика = сумма сегментов − (N−1)·D."""
+    project, plan, _ = project_with_plan
+    plan.transition = "crossfade"
+    plan.transition_duration = 0.5
+    out = render_plan(storage, project, plan, final=False, progress=lambda m: None)
+    assert out and out.exists()
+    dur = float(subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "csv=p=0", str(out)], capture_output=True, text=True).stdout.strip())
+    expected = plan.total_duration - (len(plan.segments) - 1) * 0.5
+    assert abs(dur - expected) < 0.35
+
+
 def test_segment_cache_reused(storage, project_with_plan):
     """Повторный рендер не перекодирует сегменты — берёт из кэша."""
     project, plan, _ = project_with_plan

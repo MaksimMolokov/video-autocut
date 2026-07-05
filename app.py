@@ -611,6 +611,41 @@ elif step == "export":
         e1.metric("Длительность", f"{plan.total_duration:.1f}s")
         e2.metric("Формат", project.aspect)
         e3.metric("Фрагментов", len(plan.segments))
+
+        # Предпросмотр кадрирования (ТЗ §17.5): рамка окна кропа на миниатюрах
+        with st.expander("🖼 Проверить кадрирование перед экспортом"):
+            from PIL import Image, ImageDraw
+
+            from core.smart_crop import crop_rect_norm
+            tw, th = config.ASPECTS[project.aspect]
+            cols_per_row = 4
+            segs = plan.segments
+            for row in range(0, len(segs), cols_per_row):
+                cols = st.columns(cols_per_row)
+                for col, seg in zip(cols, segs[row:row + cols_per_row]):
+                    sc = storage.get_scene(seg.scene_id)
+                    if not (sc and sc.thumbnail_path and Path(sc.thumbnail_path).exists()):
+                        continue
+                    img = Image.open(sc.thumbnail_path).convert("RGB")
+                    iw, ih = img.size
+                    focus = (None if (sc.subject_x, sc.subject_y) == (0.5, 0.5)
+                             else (sc.subject_x, sc.subject_y))
+                    x0, y0, x1, y1 = crop_rect_norm(iw, ih, tw, th, focus)
+                    d = ImageDraw.Draw(img, "RGBA")
+                    # затемняем то, что будет отрезано
+                    d.rectangle([0, 0, iw, ih], fill=(0, 0, 0, 110))
+                    d.rectangle([x0 * iw, y0 * ih, x1 * iw, y1 * ih],
+                                fill=(0, 0, 0, 0), outline=(0, 255, 136), width=3)
+                    crop_img = Image.open(sc.thumbnail_path).convert("RGB").crop(
+                        (int(x0 * iw), int(y0 * ih), int(x1 * iw), int(y1 * ih)))
+                    img.paste(crop_img, (int(x0 * iw), int(y0 * ih)))
+                    d2 = ImageDraw.Draw(img)
+                    d2.rectangle([x0 * iw, y0 * ih, x1 * iw, y1 * ih],
+                                 outline=(0, 255, 136), width=3)
+                    with col:
+                        st.image(img, use_container_width=True,
+                                 caption=f"#{seg.order + 1} {seg.slot}"
+                                         + (" 🎯" if focus else ""))
         if st.button("📦 Экспортировать mp4", type="primary", use_container_width=True):
             box = st.status("Финальный рендер…", expanded=True)
             out = render_plan(storage, project, plan, final=True, progress=box.write)

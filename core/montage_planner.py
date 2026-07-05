@@ -56,7 +56,11 @@ def build_plan(project: Project, scenes: list[Scene],
         _llm_rank(scenario, usable)
 
     plan = MontagePlan(project_id=project.id)
+    plan.transition = preset.transition
+    plan.transition_duration = preset.transition_duration if preset.transition != "cut" else 0.0
     used_scene_ids: set[str] = set()
+    used_scenes: list[Scene] = []   # для проверки похожести (анти-дубли)
+    hist_cache: dict = {}
     used_video_run: str = ""   # анти-повтор: не два фрагмента подряд из одного видео
 
     order = 0
@@ -93,6 +97,17 @@ def build_plan(project: Project, scenes: list[Scene],
             ):
                 slot_alternatives.append(scene.id)
                 continue
+            # Анти-дубли (ТЗ §23.6): не ставим сцену, похожую на уже взятую,
+            # пока есть непохожие кандидаты
+            if scene.user_flag != "pinned" and any(
+                _similar_scenes(scene, u, hist_cache) for u in used_scenes
+            ) and any(
+                c.id not in used_scene_ids
+                and not any(_similar_scenes(c, u, hist_cache) for u in used_scenes)
+                for c, _, _ in candidates
+            ):
+                slot_alternatives.append(scene.id)
+                continue
 
             frag_len = min(scene.duration, slot_spec.max_fragment, remaining)
             if frag_len < slot_spec.min_fragment:
@@ -104,6 +119,7 @@ def build_plan(project: Project, scenes: list[Scene],
                 slot=slot_spec.slot, reason=reason, crop="smart",
             ))
             used_scene_ids.add(scene.id)
+            used_scenes.append(scene)
             used_video_run = scene.video_id
             remaining -= frag_len
             order += 1
@@ -118,10 +134,50 @@ def build_plan(project: Project, scenes: list[Scene],
         plan.music_offset = cue.offset
         plan.music_fade_in = cue.fade_in
         plan.music_fade_out = cue.fade_out
-        _snap_to_beats(plan, shifted_cut_points(music, cue.offset))
+        _snap_to_beats(plan, shifted_cut_points(music, cue.offset),
+                       overlap=plan.transition_duration)
 
     _renumber(plan)
     return plan
+
+
+# --- Похожесть сцен (анти-дубли) ---
+
+def _hist(path: str):
+    """HSV-гистограмма миниатюры (кэшируется вызывающим кодом)."""
+    import cv2
+    img = cv2.imread(path)
+    if img is None:
+        return None
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    h = cv2.calcHist([hsv], [0, 1], None, [24, 16], [0, 180, 0, 256])
+    cv2.normalize(h, h)
+    return h
+
+
+def _similar_scenes(a: Scene, b: Scene, hist_cache: dict) -> bool:
+    """Похожи ли сцены настолько, что обе в одном ролике — это повтор."""
+    # соседние куски одного длинного кадра (дрон летит дальше)
+    if a.video_id == b.video_id and abs(a.start - b.start) < 20.0:
+        return True
+    # одинаковый тип + сильное пересечение содержимого
+    if a.scene_type and a.scene_type == b.scene_type:
+        sa = set(a.objects) | set(a.tags)
+        sb = set(b.objects) | set(b.tags)
+        if sa and sb:
+            jaccard = len(sa & sb) / len(sa | sb)
+            if jaccard >= 0.65:
+                # визуальное подтверждение по гистограммам миниатюр
+                import cv2
+                ha = hist_cache.setdefault(a.id, _hist(a.thumbnail_path)) \
+                    if a.thumbnail_path else None
+                hb = hist_cache.setdefault(b.id, _hist(b.thumbnail_path)) \
+                    if b.thumbnail_path else None
+                if ha is None or hb is None:
+                    return True  # миниатюр нет — доверяем тегам
+                corr = cv2.compareHist(ha, hb, cv2.HISTCMP_CORREL)
+                return corr > 0.88
+    return False
 
 
 # --- Скоринг ---
@@ -181,34 +237,43 @@ def _score(s: Scene, spec: SlotSpec) -> tuple[float, str]:
 
 
 def _pick_fragment(scene: Scene, frag_len: float) -> tuple[float, float]:
-    """Берём фрагмент из середины сцены: начала/концы часто смазаны переходом."""
+    """Окно фрагмента центрируется на лучшем моменте сцены (самый резкий
+    кадр из frame_quality), с клампом внутрь сцены. Нет best_moment —
+    берём середину: начала/концы часто смазаны переходом."""
     if scene.duration <= frag_len:
         return scene.start, scene.end
-    pad = (scene.duration - frag_len) / 2
-    start = round(scene.start + pad, 3)
-    return start, round(start + frag_len, 3)
+    center = (scene.best_moment
+              if scene.start < scene.best_moment < scene.end
+              else scene.start + scene.duration / 2)
+    start = min(max(center - frag_len / 2, scene.start), scene.end - frag_len)
+    return round(start, 3), round(start + frag_len, 3)
 
 
 # --- Музыка ---
 
-def _snap_to_beats(plan: MontagePlan, cuts: list[float]):
+def _snap_to_beats(plan: MontagePlan, cuts: list[float], overlap: float = 0.0):
     """Выравнивание границ фрагментов по точкам склейки музыки (ТЗ §16).
 
     `cuts` — таймкоды в системе координат ролика (уже сдвинутые на offset
     выбранного фрагмента трека). Склейка подтягивается к ближайшей точке
     (допуск ±0.35 сек, длительность не опускается ниже 1 сек).
+
+    `overlap` — длительность crossfade: каждый переход съедает overlap секунд
+    визуального времени, середина перехода должна попадать на бит.
     """
     if not cuts:
         return
     timeline = 0.0
-    for seg in plan.segments:
-        end_t = timeline + seg.duration
+    last = len(plan.segments) - 1
+    for i, seg in enumerate(plan.segments):
+        # видимая точка склейки: конец сегмента минус половина перекрытия
+        end_t = timeline + seg.duration - (overlap / 2 if i < last else 0.0)
         nearest = min(cuts, key=lambda c: abs(c - end_t))
         delta = nearest - end_t
         if abs(delta) <= 0.35 and seg.duration + delta >= 1.0:
             seg.src_end = round(seg.src_end + delta, 3)
             seg.beat_synced = True
-        timeline += seg.duration
+        timeline += seg.duration - (overlap if i < last else 0.0)
 
 
 def _renumber(plan: MontagePlan):
