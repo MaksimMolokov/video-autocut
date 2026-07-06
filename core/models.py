@@ -34,7 +34,7 @@ class Project:
     created_at: float = field(default_factory=time.time)
     source_paths: list[str] = field(default_factory=list)   # видеофайлы
     music_path: str = ""
-    preset_id: str = ""                                     # или свой сценарий:
+    preset_id: str = "generic"                              # или свой сценарий:
     scenario_text: str = ""
     aspect: str = "9:16"                                    # 9:16 | 16:9 | 1:1
     target_duration: int = 30                               # секунды

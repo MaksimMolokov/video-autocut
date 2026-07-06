@@ -77,6 +77,28 @@ def test_render_empty_plan(storage, project_with_plan):
     assert render_plan(storage, project, plan, final=False, progress=lambda m: None) is None
 
 
+def test_target_fps_matches_sources(storage, project_with_plan):
+    """50fps исходники → рендер 25fps (ровный дроп, без стробо-судорог);
+    прочие → 30fps."""
+    from core.models import SourceVideo
+    from core.renderer import _target_fps
+    project, plan, _ = project_with_plan
+    scene = storage.get_scene(plan.segments[0].scene_id)
+
+    v = SourceVideo(project_id=project.id, path=scene.video_path, fps=50.0)
+    v.id = scene.video_id
+    storage.save_video(v)
+    assert _target_fps(storage, plan) == 25
+
+    v.fps = 59.94
+    storage.save_video(v)
+    assert _target_fps(storage, plan) == 30
+
+    v.fps = 25.0
+    storage.save_video(v)
+    assert _target_fps(storage, plan) == 25
+
+
 def test_crossfade_render_duration(storage, project_with_plan):
     """Crossfade: длительность ролика = сумма сегментов − (N−1)·D."""
     project, plan, _ = project_with_plan

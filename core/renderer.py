@@ -64,6 +64,23 @@ def _segment_focus(scene: Scene, seg) -> tuple[float, float] | None:
     return None
 
 
+def _target_fps(storage: Storage, plan: MontagePlan) -> int:
+    """Целевой fps ролика подбирается под исходники: 50/25 fps → 25,
+    иначе 30. Неровный дроп кадров (50→30: паттерн 2-1-2-1) даёт
+    стробо-судорожность на панорамах — ровное деление её убирает."""
+    fps_list = []
+    for seg in plan.segments:
+        scene = storage.get_scene(seg.scene_id)
+        if scene:
+            video = storage.get_video(scene.video_id)
+            if video and video.fps:
+                fps_list.append(video.fps)
+    if fps_list and all(abs(f % 25) < 0.6 or abs(f % 25 - 25) < 0.6
+                        for f in fps_list):
+        return 25   # 25/50/100 fps — кратный дроп без судорог
+    return 30
+
+
 _STAB_FILTER = None  # определяется один раз: vidstab (лучше) или deshake
 
 
@@ -105,6 +122,7 @@ def render_plan(storage: Storage, project: Project, plan: MontagePlan,
 
     seg_cache = pdir / "cache" / "segments"
     seg_cache.mkdir(parents=True, exist_ok=True)
+    out_fps = _target_fps(storage, plan)
 
     # 1. Нарезка сегментов: умный кроп + пофрагментный кэш
     parts: list[Path] = []
@@ -123,7 +141,7 @@ def render_plan(storage: Storage, project: Project, plan: MontagePlan,
 
         key = hashlib.md5(
             f"{seg.scene_id}:{seg.src_start:.3f}:{seg.src_end:.3f}:"
-            f"{w}x{h}:{'f' if final else 'p'}:{cw}x{ch}+{x}+{y}"
+            f"{w}x{h}@{out_fps}:{'f' if final else 'p'}:{cw}x{ch}+{x}+{y}"
             f"{':stab' if stab else ''}".encode()
         ).hexdigest()[:16]
         part = seg_cache / f"{key}.mp4"
@@ -152,7 +170,7 @@ def render_plan(storage: Storage, project: Project, plan: MontagePlan,
                 vf += f",vidstabtransform=input={trf}:zoom=5:smoothing=25"
             else:
                 vf += f",deshake=rx=32:ry=32,crop={zw}:{zh},scale={w}:{h}"
-        vf += ",setsar=1,fps=30"
+        vf += f",setsar=1,fps={out_fps}"
         cmd = [
             "ffmpeg", "-y", "-v", "error",
             "-ss", f"{seg.src_start:.3f}", "-i", scene.video_path,

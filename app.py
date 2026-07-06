@@ -323,7 +323,10 @@ elif step == "settings":
     c1, c2 = st.columns([3, 2])
     with c1:
         preset_ids = list(PRESETS)
-        cur = preset_ids.index(project.preset_id) if project.preset_id in preset_ids else 0
+        # дефолт — универсальный пресет, а не первый в списке (fpv слишком агрессивен)
+        cur = (preset_ids.index(project.preset_id)
+               if project.preset_id in preset_ids
+               else preset_ids.index("generic"))
         preset_id = st.selectbox("Пресет сценария", preset_ids, index=cur,
                                  format_func=lambda k: PRESETS[k].title)
         st.markdown(f'<div class="ai-explain">{PRESETS[preset_id].idea}</div>',
