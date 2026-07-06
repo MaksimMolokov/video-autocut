@@ -51,6 +51,10 @@ def cmd_analyze_project(args):
     project = _resolve_project(storage, args.project)
     if not project.source_paths:
         sys.exit("У проекта нет исходников")
+    if getattr(args, "force", False):
+        # полный переанализ: сброс кэша file-hash (напр., изменилась нарезка сцен)
+        for v in storage.list_videos(project.id):
+            storage.delete_video(v.id)
     pdir = storage.project_dir(project.id)
     if not worker_lock.acquire(pdir):
         sys.exit("Анализ этого проекта уже идёт — второй воркер не запущен")
@@ -165,6 +169,8 @@ def main():
     ap_ = sub.add_parser("analyze-project", help="анализ существующего проекта (фоновый воркер)")
     ap_.add_argument("--project", required=True)
     ap_.add_argument("--no-llm", action="store_true")
+    ap_.add_argument("--force", action="store_true",
+                     help="полный переанализ, игнорируя кэш file-hash")
     ap_.set_defaults(func=cmd_analyze_project)
 
     l = sub.add_parser("llm", help="дозаполнить LLM-описания сцен")

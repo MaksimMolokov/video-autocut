@@ -40,14 +40,16 @@ class QualityResult:
     jerkiness: float = 0.0    # 0..1 (1 = очень дёрганая)
 
 
-def analyze_scene_quality(path: str, start: float, end: float) -> QualityResult:
+def analyze_scene_quality(path: str, start: float, end: float,
+                          n_bursts: int = _N_BURSTS) -> QualityResult:
+    """n_bursts=3 — облегчённый режим для валидации окна фрагмента."""
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         return QualityResult(0, 0, 0, 0, "static", "none", [start + (end - start) / 2])
 
     try:
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        burst_times = np.linspace(start, end, _N_BURSTS + 2)[1:-1]
+        burst_times = np.linspace(start, end, n_bursts + 2)[1:-1]
 
         bursts: list[list[np.ndarray]] = []   # серии последовательных серых кадров
         sharpness_vals: list[float] = []
@@ -150,7 +152,9 @@ def _motion_metrics(bursts: list[list[np.ndarray]],
         return "static", "none", 1.0, 0.0
 
     speed = float(np.median(speeds))          # px/кадр на ~640px
-    accel = float(np.median(accels)) if accels else 0.0
+    # 75-й перцентиль вместо медианы: разворот камеры в одном бёрсте из
+    # нескольких не должен «прощаться» усреднением
+    accel = float(np.percentile(accels, 75)) if accels else 0.0
     flip_ratio = flips / pairs if pairs else 0.0
     radial = float(np.median(radials)) if radials else 0.0
     speed_pps = speed * fps                   # px/сек для классификации темпа

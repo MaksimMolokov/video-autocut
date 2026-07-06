@@ -221,6 +221,29 @@ def test_plan_avoids_duplicate_looking_scenes():
     assert not ({twin_a.id, twin_b.id} <= used)   # обе сразу — никогда
 
 
+def test_best_window_avoids_camera_whip(mixed_motion_video):
+    """Ядро фикса «фрагменты на разворотах»: скользящее окно обходит
+    резкий разворот камеры в середине куска."""
+    from core.montage_planner import _pick_best_window
+    s = _scene(video_id="vm", start=0.0, end=8.0)
+    s.video_path = str(mixed_motion_video)
+    s.best_moment = 4.0  # самый резкий кадр мог попасть и на разворот
+    window = _pick_best_window(s, 2.5, prefer_motion=["slow"])
+    assert window is not None
+    st, en = window
+    # окно не накрывает ядро разворота (3.5–4.5с)
+    overlap = max(0.0, min(en, 4.5) - max(st, 3.5))
+    assert overlap < 0.3, f"окно {st}-{en} легло на разворот"
+
+
+def test_best_window_rejects_fully_shaky(shaky_video):
+    """Вся сцена дёрганая → None, кандидат отклоняется целиком."""
+    from core.montage_planner import _pick_best_window
+    s = _scene(video_id="vs", start=0.2, end=3.8)
+    s.video_path = str(shaky_video)
+    assert _pick_best_window(s, 2.0, prefer_motion=[]) is None
+
+
 def test_pick_fragment_centers_on_best_moment():
     s = _scene(start=10.0, end=20.0)
     s.best_moment = 12.0

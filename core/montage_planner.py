@@ -114,7 +114,10 @@ def build_plan(project: Project, scenes: list[Scene],
             frag_len = min(scene.duration, slot_spec.max_fragment, remaining)
             if frag_len < slot_spec.min_fragment:
                 continue
-            src_start, src_end = _pick_fragment(scene, frag_len)
+            window = _pick_best_window(scene, frag_len, slot_spec.prefer_motion)
+            if window is None:
+                continue  # все окна сцены дёрганые — следующий кандидат
+            src_start, src_end = window
             if scene.speech_segments:
                 # не резать посреди фразы (ТЗ §8, Whisper)
                 from core.speech_analyzer import adjust_for_speech
@@ -255,6 +258,47 @@ def _pick_fragment(scene: Scene, frag_len: float) -> tuple[float, float]:
               else scene.start + scene.duration / 2)
     start = min(max(center - frag_len / 2, scene.start), scene.end - frag_len)
     return round(start, 3), round(start + frag_len, 3)
+
+
+def _pick_best_window(scene: Scene, frag_len: float,
+                      prefer_motion: list[str],
+                      _cache: dict = {}) -> tuple[float, float] | None:  # noqa: B006 — межвызовной кэш
+    """Скользящее окно: выбирает самый плавный и резкий участок сцены.
+
+    Именно здесь отбраковываются развороты камеры между «сюжетами»:
+    метрики сцены — усреднение, а фрагмент проверяется КОНКРЕТНО.
+    None — вся сцена дёрганая, кандидат отклоняется целиком.
+    """
+    from core.frame_quality import analyze_scene_quality
+
+    if scene.duration <= frag_len + 0.2:
+        starts = [scene.start]
+    else:
+        span = scene.end - frag_len - scene.start
+        starts = sorted({round(scene.start + span * k, 2)
+                         for k in (0.0, 1 / 3, 2 / 3, 1.0)}
+                        | {_pick_fragment(scene, frag_len)[0]})
+
+    best, best_score = None, -1e9
+    for st in starts:
+        key = (scene.id, st, round(frag_len, 2))
+        q = _cache.get(key)
+        if q is None:
+            q = analyze_scene_quality(scene.video_path, st, st + frag_len,
+                                      n_bursts=3)
+            _cache[key] = q
+        if q.motion_type == "shake" or q.jerkiness >= config.FRAGMENT_JERK_MAX:
+            continue  # окно накрыло разворот/тряску — не кандидат
+        score = (0.55 * q.stability_score
+                 + 0.25 * min(q.sharpness / 150.0, 1.0)
+                 + (0.20 if (not prefer_motion or q.motion in prefer_motion)
+                    else 0.0))
+        if score > best_score:
+            best, best_score = st, score
+    if best is None:
+        log.info("Сцена %s: все окна дёрганые — исключена из монтажа", scene.id)
+        return None
+    return round(best, 3), round(best + frag_len, 3)
 
 
 # --- Музыка ---

@@ -94,6 +94,23 @@ def smooth_pan_video(media_dir: Path) -> Path:
     return out
 
 
+@pytest.fixture(scope="session")
+def mixed_motion_video(media_dir: Path) -> Path:
+    """8 секунд: плавная панорама (0–3с) → резкие развороты (3–5с) →
+    плавная панорама (5–8с). Имитация непрерывной дрон-съёмки."""
+    out = media_dir / "mixed_motion.mp4"
+    expr_x = "if(between(t,3,5), floor(random(1)*160), (iw-ow)*t/8)"
+    expr_y = "if(between(t,3,5), floor(random(2)*90), 45)"
+    subprocess.run(
+        ["ffmpeg", "-y", "-v", "error",
+         "-f", "lavfi", "-i", "testsrc2=duration=8:size=800x450:rate=30",
+         "-vf", f"crop=640:360:x='{expr_x}':y='{expr_y}'",
+         "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", str(out)],
+        check=True, capture_output=True,
+    )
+    return out
+
+
 @pytest.fixture()
 def storage(tmp_path, monkeypatch) -> Storage:
     """Изолированное хранилище: и БД, и папки проектов — во временной директории."""
