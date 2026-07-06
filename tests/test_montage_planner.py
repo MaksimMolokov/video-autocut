@@ -221,6 +221,19 @@ def test_plan_avoids_duplicate_looking_scenes():
     assert not ({twin_a.id, twin_b.id} <= used)   # обе сразу — никогда
 
 
+def test_motion_profile_dense_coverage(mixed_motion_video):
+    """Плотный профиль: ~20 замеров/сек по всей сцене, рывки видны точно."""
+    import numpy as np
+    from core.frame_quality import motion_profile, window_motion_ok
+    times, vecs = motion_profile(str(mixed_motion_video), 0.0, 8.0)
+    assert len(times) >= 8 * 20 * 0.8          # плотность ~20 Гц
+    # спокойное окно — ок, окно на развороте (3–5с) — нет
+    ok_calm, bad_calm = window_motion_ok(times, vecs, 0.3, 2.7)
+    ok_jerk, bad_jerk = window_motion_ok(times, vecs, 3.2, 4.8)
+    assert ok_calm and not ok_jerk
+    assert bad_jerk > bad_calm * 3             # разделение уверенное
+
+
 def test_best_window_avoids_camera_whip(mixed_motion_video):
     """Ядро фикса «фрагменты на разворотах»: скользящее окно обходит
     резкий разворот камеры в середине куска."""

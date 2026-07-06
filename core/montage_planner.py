@@ -15,6 +15,8 @@ import json
 import logging
 import random
 
+import numpy as np
+
 import config
 from core.audio_analyzer import MusicAnalysis
 from core.llm_analyzer import LLMAnalyzer
@@ -263,40 +265,46 @@ def _pick_fragment(scene: Scene, frag_len: float) -> tuple[float, float]:
 def _pick_best_window(scene: Scene, frag_len: float,
                       prefer_motion: list[str],
                       _cache: dict = {}) -> tuple[float, float] | None:  # noqa: B006 — межвызовной кэш
-    """Скользящее окно: выбирает самый плавный и резкий участок сцены.
+    """Скользящее окно по ПЛОТНОМУ профилю движения сцены.
 
-    Именно здесь отбраковываются развороты камеры между «сюжетами»:
-    метрики сцены — усреднение, а фрагмент проверяется КОНКРЕТНО.
+    Профиль покрывает каждый кадр (20 замеров/сек через ffmpeg) — рывок
+    длиной 0.3с не проскочит между точками, как при бёрст-сэмплировании.
+    Окно двигается с шагом 0.5с; выбирается самое плавное.
     None — вся сцена дёрганая, кандидат отклоняется целиком.
     """
-    from core.frame_quality import analyze_scene_quality
+    from core.frame_quality import motion_profile, window_motion_ok
 
+    profile = _cache.get(scene.id)
+    if profile is None:
+        profile = motion_profile(scene.video_path, scene.start, scene.end)
+        _cache[scene.id] = profile if profile is not None else "fail"
+    if profile == "fail" or profile is None:
+        # декодер не справился — старый грубый путь (бёрсты)
+        return _pick_fragment(scene, frag_len)
+    times, vecs = profile
+
+    allow_fast = "fast" in prefer_motion if prefer_motion else False
     if scene.duration <= frag_len + 0.2:
         starts = [scene.start]
     else:
-        span = scene.end - frag_len - scene.start
-        starts = sorted({round(scene.start + span * k, 2)
-                         for k in (0.0, 1 / 3, 2 / 3, 1.0)}
-                        | {_pick_fragment(scene, frag_len)[0]})
+        last = scene.end - frag_len
+        starts = list(np.arange(scene.start, last + 0.01, 0.5))
+        if starts[-1] < last - 0.05:
+            starts.append(last)
 
-    best, best_score = None, -1e9
+    best, best_bad = None, float("inf")
+    prefer_center = _pick_fragment(scene, frag_len)[0]  # тяготение к best_moment
     for st in starts:
-        key = (scene.id, st, round(frag_len, 2))
-        q = _cache.get(key)
-        if q is None:
-            q = analyze_scene_quality(scene.video_path, st, st + frag_len,
-                                      n_bursts=3)
-            _cache[key] = q
-        if q.motion_type == "shake" or q.jerkiness >= config.FRAGMENT_JERK_MAX:
-            continue  # окно накрыло разворот/тряску — не кандидат
-        score = (0.55 * q.stability_score
-                 + 0.25 * min(q.sharpness / 150.0, 1.0)
-                 + (0.20 if (not prefer_motion or q.motion in prefer_motion)
-                    else 0.0))
-        if score > best_score:
-            best, best_score = st, score
+        ok, badness = window_motion_ok(times, vecs, st, st + frag_len,
+                                       allow_fast=allow_fast)
+        if not ok:
+            continue
+        badness += 0.05 * abs(st - prefer_center)  # при равной плавности — резкий момент
+        if badness < best_bad:
+            best, best_bad = st, badness
     if best is None:
-        log.info("Сцена %s: все окна дёрганые — исключена из монтажа", scene.id)
+        log.info("Сцена %s: все окна дёрганые (плотный профиль) — исключена",
+                 scene.id)
         return None
     return round(best, 3), round(best + frag_len, 3)
 

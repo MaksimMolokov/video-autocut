@@ -107,6 +107,77 @@ def analyze_scene_quality(path: str, start: float, end: float,
         cap.release()
 
 
+# --- Плотный профиль движения (без слепых зон) ---
+_DENSE_FPS = 20      # замеров в секунду — рывок 0.3с покрывается 6 замерами
+_DENSE_W = 256       # ширина кадра для замера (ffmpeg масштабирует сам)
+
+
+def motion_profile(path: str, start: float, end: float
+                   ) -> tuple[np.ndarray, np.ndarray] | None:
+    """Глобальное смещение камеры между КАЖДОЙ парой кадров сцены.
+
+    ffmpeg отдаёт все кадры сцены в 256px градациях серого (20 fps),
+    cv2.phaseCorrelate меряет сдвиг пары. Возвращает (times, vectors):
+    times — секунды в исходнике, vectors — (dx, dy) px/замер на 256px.
+    None — декодировать не удалось.
+    """
+    import subprocess
+    h = int(_DENSE_W * 9 / 16 / 2) * 2  # 144 для 16:9; для вертикалей ок тоже
+    cmd = [
+        "ffmpeg", "-v", "error",
+        "-ss", f"{start:.3f}", "-i", path, "-t", f"{end - start:.3f}",
+        "-vf", f"fps={_DENSE_FPS},scale={_DENSE_W}:{h}",
+        "-f", "rawvideo", "-pix_fmt", "gray", "-",
+    ]
+    try:
+        raw = subprocess.run(cmd, capture_output=True, timeout=120).stdout
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    frame_size = _DENSE_W * h
+    n = len(raw) // frame_size
+    if n < 3:
+        return None
+    frames = np.frombuffer(raw[:n * frame_size], dtype=np.uint8)
+    frames = frames.reshape(n, h, _DENSE_W).astype(np.float32)
+
+    vecs = np.zeros((n - 1, 2), dtype=np.float32)
+    for i in range(n - 1):
+        (dx, dy), _ = cv2.phaseCorrelate(frames[i], frames[i + 1])
+        vecs[i] = (dx, dy)
+    times = start + (np.arange(n - 1) + 0.5) / _DENSE_FPS
+    return times, vecs
+
+
+def window_motion_ok(times: np.ndarray, vecs: np.ndarray,
+                     w_start: float, w_end: float,
+                     allow_fast: bool = False) -> tuple[bool, float]:
+    """Есть ли рывки в окне [w_start, w_end] по плотному профилю.
+
+    Возвращает (ok, badness): badness — чем меньше, тем плавнее окно.
+    Пороги в px/замер на 256px (20 замеров/сек):
+    разворот камеры даёт скачок скорости/ускорения на порядок выше панорамы.
+    """
+    mask = (times >= w_start) & (times <= w_end)
+    if mask.sum() < 4:
+        return True, 0.0   # профиля нет — не блокируем (решат бёрсты)
+    v = vecs[mask]
+    speed = np.linalg.norm(v, axis=1)
+    accel = np.abs(np.diff(speed))
+    # смена направления на заметной скорости = дёрганье камеры
+    dots = np.sum(v[:-1] * v[1:], axis=1)
+    mags = speed[:-1] * speed[1:]
+    flips = int(np.sum((dots < 0) & (mags > 9.0)))
+
+    sp95 = float(np.percentile(speed, 95))
+    ac95 = float(np.percentile(accel, 95)) if len(accel) else 0.0
+    # калибровка: плавная панорама sp95≈5 ac95≈4, разворот sp95≈50 ac95≈33
+    sp_max = 22.0 if allow_fast else 10.0
+    ac_max = 12.0 if allow_fast else 6.0
+    ok = sp95 <= sp_max and ac95 <= ac_max and flips <= (3 if allow_fast else 1)
+    badness = ac95 + 0.4 * sp95 + 2.0 * flips
+    return ok, round(badness, 3)
+
+
 def _flow(prev: np.ndarray, curr: np.ndarray) -> np.ndarray | None:
     """Медианный вектор оптического потока между двумя кадрами (px/кадр)."""
     pts = cv2.goodFeaturesToTrack(prev, maxCorners=120, qualityLevel=0.01, minDistance=12)
