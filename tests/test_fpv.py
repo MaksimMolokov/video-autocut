@@ -149,6 +149,116 @@ def test_detect_zones_fallback(storage, fpv_setup, monkeypatch):
     assert len(storage.list_zones(video.id)) == len(zones)
 
 
+# ─────────── интересность и автосюжеты (фикс «всё видео перемотано») ───────────
+
+def test_interest_score_orders_by_aesthetic_and_people():
+    from core.fpv import _interest_score
+    plain = Scene(video_id="v", video_path="/x.mp4", start=0, end=10,
+                 aesthetic_score=0.2, quality_score=0.5, people_count=0)
+    pretty = Scene(video_id="v", video_path="/x.mp4", start=0, end=10,
+                  aesthetic_score=0.9, quality_score=0.8, people_count=1)
+    assert _interest_score(pretty) > _interest_score(plain)
+
+
+def test_auto_zones_spread_across_long_uniform_route(storage, synthetic_video):
+    """Главный сценарий бага: цельный однородный дубль (танец, спорт), где
+    старая группировка по похожести схлопнула бы всё в ОДИН блок (все куски
+    одного видео в пределах 20с считались «похожими» → одна гигантская
+    зона → почти весь ролик становится перемоткой). detect_zones должен
+    вернуть >=4 зоны, распределённые по всей длине, а не только в начале."""
+    from core.fpv import detect_zones
+    project = Project(name="dance", target_duration=40, fpv_style="smooth")
+    storage.save_project(project)
+    video = SourceVideo(project_id=project.id, path=str(synthetic_video),
+                        duration=200.0, fps=30, width=640, height=360,
+                        fpv_showroom=True, valid=True)
+    storage.save_video(video)
+    scenes = []
+    for i in range(20):  # 20×10с = 200с одного цельного дубля
+        s = Scene(project_id=project.id, video_id=video.id,
+                 video_path=str(synthetic_video),
+                 start=i * 10.0, end=(i + 1) * 10.0,
+                 quality_score=0.7, llm_status="done", description=f"кусок {i}",
+                 # каждый третий кусок — «яркий момент» (высокая эстетика/люди)
+                 aesthetic_score=0.9 if i % 3 == 0 else 0.3,
+                 people_count=1 if i % 3 == 0 else 0)
+        scenes.append(s)
+    storage.save_scenes(scenes)
+
+    zones = detect_zones(storage, project, video)
+    assert len(zones) >= 4
+    starts = [z.start for z in zones]
+    assert starts == sorted(starts)
+    # зоны разбросаны по всему маршруту, а не только в первой трети
+    assert max(starts) > 200 * 0.5
+    assert min(starts) < 200 * 0.3
+    # ни одна зона не покрывает больше половины маршрута — иначе снова
+    # «всё видео перемотано»
+    assert all(z.duration < 100 for z in zones)
+
+
+def test_auto_zones_skips_duplicate_adjacent_scene():
+    from core.fpv import _auto_zones
+    project = Project(name="p", target_duration=40)
+    scenes = [Scene(video_id="v", video_path="/x.mp4",
+                    start=i * 10.0, end=(i + 1) * 10.0,
+                    aesthetic_score=0.5, quality_score=0.5)
+             for i in range(6)]
+    zones = _auto_zones(project, SourceVideo(project_id="p", path="/x.mp4"),
+                        scenes, 0.0, 60.0)
+    ids = [z.title for z in zones]
+    # соседние полосы не должны выбрать один и тот же кусок дважды подряд
+    scene_ids_selected = []
+    for z in zones:
+        for s in scenes:
+            if s.start == z.start and s.end == z.end:
+                scene_ids_selected.append(s.id)
+    assert len(scene_ids_selected) == len(set(dict.fromkeys(scene_ids_selected)))
+    for a, b in zip(scene_ids_selected, scene_ids_selected[1:]):
+        assert a != b
+
+
+def test_best_window_prefers_interesting_scene(storage, synthetic_video, monkeypatch):
+    """При одинаково плавном движении окно внутри зоны выбирает участок с
+    более интересным содержанием (человек в кадре), а не первый попавшийся."""
+    import core.frame_quality as fq_mod
+    monkeypatch.setattr(fq_mod, "motion_profile", lambda *a, **k: None)
+    project = Project(name="pick", target_duration=20, fpv_style="smooth")
+    storage.save_project(project)
+    video = SourceVideo(project_id=project.id, path=str(synthetic_video),
+                        duration=30.0, fps=30, width=640, height=360,
+                        fpv_showroom=True, valid=True)
+    storage.save_video(video)
+    storage.save_scenes([
+        Scene(project_id=project.id, video_id=video.id, video_path=str(synthetic_video),
+             start=0, end=10, quality_score=0.7, aesthetic_score=0.1, llm_status="done"),
+        Scene(project_id=project.id, video_id=video.id, video_path=str(synthetic_video),
+             start=10, end=20, quality_score=0.7, aesthetic_score=0.95,
+             people_count=2, llm_status="done"),
+        Scene(project_id=project.id, video_id=video.id, video_path=str(synthetic_video),
+             start=20, end=30, quality_score=0.7, aesthetic_score=0.1, llm_status="done"),
+    ])
+    storage.save_zone(Zone(project_id=project.id, video_id=video.id, start=0, end=30,
+                           title="весь маршрут", required=True, technical=False))
+
+    plan = build_fpv_plan(storage, project, video)
+    zone_seg = next(s for s in plan.segments if s.speed == 1.0)
+    # окно должно попасть на интересный средний кусок (10-20с), не на края
+    assert 9.0 <= zone_seg.src_start <= 14.5
+
+
+def test_route_tail_never_silently_dropped(storage, fpv_setup):
+    """Регрессия: если последняя показанная зона совпадает с концом
+    активного маршрута, хвост после её окна должен появиться перемоткой,
+    а не пропасть — иначе локация показана не до конца."""
+    project, video, _ = fpv_setup
+    plan = build_fpv_plan(storage, project, video)
+    last_end = max(seg.src_end for seg in plan.segments)
+    zones = storage.list_zones(video.id)
+    route_end = max(z.end for z in zones if not z.technical)
+    assert last_end >= route_end - 0.5
+
+
 # ─────────── скорость в модели ───────────
 
 def test_segment_out_duration():

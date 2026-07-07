@@ -402,6 +402,20 @@ elif step == "analysis":
                     f'<div class="stat-lbl">описано ИИ</div></div>'
                     '</div>', unsafe_allow_html=True)
         st.markdown("<br>", unsafe_allow_html=True)
+        if n_done == 0:
+            from core.llm_analyzer import LLMAnalyzer
+            reachable = LLMAnalyzer().is_available()
+            if reachable:
+                st.warning("⚠️ Ни одна сцена не получила описание от ИИ, хотя "
+                          "LM Studio сейчас доступен. Нажмите «🧠 Дозаполнить "
+                          "описания» ниже — вероятно, во время анализа модель "
+                          "была ещё не загружена.")
+            else:
+                st.error("⚠️ Ни одна сцена не получила описание от ИИ — LM Studio "
+                         "недоступен (localhost:1234). Отбор сцен и showroom-зоны "
+                         "будут работать по резервным правилам, без учёта содержания "
+                         "кадра. Запустите LM Studio с загруженной vision-моделью "
+                         "(Qwen3-VL) и нажмите «🧠 Дозаполнить описания» ниже.")
 
     with_llm = st.checkbox("Смысловой анализ кадров (Qwen3-VL 8B через LM Studio)", True,
                            help="Нужен запущенный LM Studio. Можно дозаполнить позже.")
@@ -570,27 +584,53 @@ elif step == "draft":
     ready = [s for s in scenes if s.user_flag != "banned"]
     plan = storage.latest_plan(project.id)
 
-    # ── 🚁 FPV Showroom: зоны маршрута, стиль, сборка ──
+    n_done = sum(1 for s in scenes if s.llm_status == "done")
+    if scenes and n_done == 0:
+        st.warning("⚠️ Ни одна сцена не получила описание от ИИ — отбор сцен и "
+                  "showroom-зоны работают по резервным правилам, без учёта "
+                  "содержания кадра. Проверьте LM Studio на шаге «AI Анализ».")
+
+    # ── Режим сборки: обычный монтаж или FPV showroom (одна кнопка ниже
+    # выполняет действие для выбранного режима — раньше было две похожие
+    # кнопки «Собрать showroom» и «Создать черновик», это сбивало с толку) ──
     fpv_videos = [v for v in storage.list_videos(project.id) if v.fpv_showroom]
+    mode_key = f"draft_mode_{project.id}"
     if fpv_videos:
-        with st.expander("🚁 FPV Showroom — обзор локации одним маршрутом",
-                         expanded=plan is None or plan.mode == "fpv"):
-            from core.fpv import STYLES, build_fpv_plan, detect_zones
-            video = fpv_videos[0]
+        default_mode = "fpv" if (plan and plan.mode == "fpv") else "standard"
+        mode = st.radio(
+            "Режим сборки", ["standard", "fpv"],
+            index=["standard", "fpv"].index(st.session_state.get(mode_key, default_mode)),
+            format_func=lambda m: "🎬 Обычный монтаж" if m == "standard"
+                         else "🚁 FPV Showroom (один маршрут)",
+            horizontal=True, key=mode_key)
+    else:
+        mode = "standard"
+
+    # ── 🚁 FPV Showroom: зоны маршрута и стиль (без своей кнопки сборки) ──
+    fpv_video = None
+    if mode == "fpv" and fpv_videos:
+        with st.expander("🚁 Зоны маршрута", expanded=True):
+            from core.fpv import STYLES, detect_zones
+            fpv_video = fpv_videos[0]
             if len(fpv_videos) > 1:
                 names = {Path(v.path).name: v for v in fpv_videos}
-                video = names[st.selectbox("FPV-файл", list(names))]
+                fpv_video = names[st.selectbox("FPV-файл", list(names))]
 
-            zones = storage.list_zones(video.id)
-            zc1, zc2 = st.columns([1, 3])
-            if zc1.button("🔍 Найти зоны" if not zones else "🔄 Передетектировать"):
+            zones = storage.list_zones(fpv_video.id)
+            if st.button("🔍 Найти зоны" if not zones else "🔄 Передетектировать"):
                 with st.spinner("Детекция зон маршрута…"):
-                    zones = detect_zones(storage, project, video)
+                    zones = detect_zones(storage, project, fpv_video)
                 st.rerun()
 
             if zones:
-                st.caption("Отметьте обязательные зоны; технические (взлёт/посадка) "
-                           "исключаются из ролика. Границы можно поправить.")
+                vid_scenes = storage.list_scenes_by_video(fpv_video.id)
+                n_llm = sum(1 for s in vid_scenes if s.llm_status == "done")
+                method_note = ("по описаниям ИИ" if vid_scenes and n_llm / len(vid_scenes) >= 0.6
+                              else "по резервному алгоритму — мало ИИ-описаний")
+                st.caption(f"Зоны определены {method_note}. Отметьте обязательные "
+                          "(★) — покажутся на нормальной скорости; технические "
+                          "(⚙️, взлёт/посадка) исключаются из ролика. Границы "
+                          "можно поправить.")
                 for z in zones:
                     c_img, c_body = st.columns([1, 4])
                     if z.thumbnail_path and Path(z.thumbnail_path).exists():
@@ -618,31 +658,20 @@ elif step == "draft":
                                 z.start, z.end = float(zs), float(ze)
                             storage.save_zone(z)
 
-                s_col1, s_col2 = st.columns([2, 1])
-                style_id = s_col1.radio(
+                project.fpv_style = st.radio(
                     "Стиль showroom", list(STYLES),
                     index=list(STYLES).index(project.fpv_style)
                     if project.fpv_style in STYLES else 0,
                     format_func=lambda k: STYLES[k]["title"], horizontal=True)
-                if s_col2.button("🚁 Собрать showroom", type="primary",
-                                 use_container_width=True):
-                    project.fpv_style = style_id
-                    storage.save_project(project)
-                    with st.spinner("FPV-план и рендер…"):
-                        music = None
-                        if project.music_path and Path(project.music_path).exists():
-                            music = analyze_music_cached(storage, project.music_path)
-                        fplan = build_fpv_plan(storage, project, video, music)
-                        storage.save_plan(fplan)
-                        render_plan(storage, project, fplan, final=False,
-                                    progress=lambda m: None)
-                    st.rerun()
+                storage.save_project(project)
+            else:
+                st.caption("Сначала нажмите «Найти зоны»")
 
             if plan and plan.mode == "fpv" and plan.warnings:
                 for wmsg in plan.warnings:
                     st.warning(wmsg)
 
-    def _rebuild(variant: int):
+    def _rebuild_standard(variant: int):
         with st.spinner("Монтажный план…"):
             music = None
             if project.music_path and Path(project.music_path).exists():
@@ -654,19 +683,41 @@ elif step == "draft":
             render_plan(storage, project, new_plan, final=False, progress=lambda m: None)
         st.rerun()
 
+    def _rebuild_fpv():
+        from core.fpv import build_fpv_plan
+        with st.spinner("FPV-план и рендер…"):
+            music = None
+            if project.music_path and Path(project.music_path).exists():
+                music = analyze_music_cached(storage, project.music_path)
+            fplan = build_fpv_plan(storage, project, fpv_video, music)
+            storage.save_plan(fplan)
+            render_plan(storage, project, fplan, final=False, progress=lambda m: None)
+        st.rerun()
+
     cbtn, cvid = st.columns([1, 2])
     with cbtn:
-        use_llm_rank = st.checkbox("LLM-ранжирование сцен", True)
-        label = "🎬 Пересобрать черновик" if plan else "🎬 Сгенерировать черновик"
-        if st.button(label, type="primary", use_container_width=True, disabled=not ready):
-            st.session_state["plan_variant"] = 0
-            _rebuild(0)
-        if plan and st.button("🎲 Другой вариант", use_container_width=True,
-                              disabled=not ready,
-                              help="Пересоберёт черновик из других сцен-кандидатов"):
-            v = st.session_state.get("plan_variant", 0) + 1
-            st.session_state["plan_variant"] = v
-            _rebuild(v)
+        if mode == "standard":
+            use_llm_rank = st.checkbox("LLM-ранжирование сцен", True)
+            label = ("🎬 Пересобрать черновик" if (plan and plan.mode == "standard")
+                     else "🎬 Собрать черновик")
+            if st.button(label, type="primary", use_container_width=True,
+                        disabled=not ready):
+                st.session_state["plan_variant"] = 0
+                _rebuild_standard(0)
+            if plan and plan.mode == "standard" and st.button(
+                    "🎲 Другой вариант", use_container_width=True, disabled=not ready,
+                    help="Пересоберёт черновик из других сцен-кандидатов"):
+                v = st.session_state.get("plan_variant", 0) + 1
+                st.session_state["plan_variant"] = v
+                _rebuild_standard(v)
+        else:
+            zones_exist = bool(fpv_video and storage.list_zones(fpv_video.id))
+            label = ("🎬 Пересобрать showroom" if (plan and plan.mode == "fpv")
+                     else "🎬 Собрать черновик")
+            if st.button(label, type="primary", use_container_width=True,
+                        disabled=not zones_exist,
+                        help=None if zones_exist else "Сначала найдите зоны маршрута выше"):
+                _rebuild_fpv()
         if plan and project.music_path:
             st.markdown(
                 f'<div class="ai-explain">Музыка: фрагмент с {plan.music_offset:.0f}s, '
