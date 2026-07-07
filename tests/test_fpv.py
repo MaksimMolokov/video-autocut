@@ -302,6 +302,131 @@ def test_route_tail_never_silently_dropped(storage, fpv_setup):
     assert last_end >= route_end - 0.5
 
 
+# ─────────── длинные зоны → несколько моментов; хард-вырез технических ───────────
+
+def test_expand_long_zone_creates_multiple_moments(synthetic_video):
+    """Длинная зона (60с непрерывного танца) должна дать НЕСКОЛЬКО моментов
+    с перемоткой между ними, а не один показ + одну гигантскую перемотку
+    до следующей зоны — прямая репродукция жалобы пользователя."""
+    from core.fpv import _expand_long_zones
+    project = Project(name="dance", target_duration=45, fpv_style="smooth")
+    video = SourceVideo(project_id="p", path=str(synthetic_video))
+    scenes = [
+        Scene(video_id="v", video_path=str(synthetic_video),
+             start=i * 10.0, end=(i + 1) * 10.0,
+             aesthetic_score=0.7, quality_score=0.6,
+             people_count=1 if i % 2 == 0 else 2)
+        for i in range(6)  # 60с одной длинной зоны
+    ]
+    long_zone = Zone(project_id="p", video_id="v", start=0.0, end=60.0,
+                     title="Танец на первом этаже", required=True, technical=False)
+    target_span = 6.0 * 3.0  # style smooth window max=6 → target_span=18
+    expanded = _expand_long_zones(project, video, scenes, [long_zone], target_span)
+    assert len(expanded) >= 2  # больше одного момента
+    starts = [z.start for z in expanded]
+    assert starts == sorted(starts)
+    for z in expanded:
+        assert long_zone.start <= z.start and z.end <= long_zone.end
+
+
+def test_expand_long_zone_leaves_short_zone_untouched():
+    from core.fpv import _expand_long_zones
+    project = Project(name="p", target_duration=45)
+    video = SourceVideo(project_id="p", path="/x.mp4")
+    short_zone = Zone(project_id="p", video_id="v", start=0.0, end=8.0, title="вход")
+    expanded = _expand_long_zones(project, video, [], [short_zone], target_span=18.0)
+    assert expanded == [short_zone]
+
+
+def test_split_excluding_technical_middle():
+    from core.fpv import _split_excluding_technical
+    tech = [Zone(project_id="p", video_id="v", start=70.0, end=79.0,
+                technical=True, required=False)]
+    assert _split_excluding_technical(65.0, 85.0, tech) == [(65.0, 70.0), (79.0, 85.0)]
+
+
+def test_split_excluding_technical_covers_whole_gap():
+    """Техническая зона занимает весь промежуток целиком — перемотки не
+    остаётся вообще: footage не должно появиться в ролике ни на какой
+    скорости (репродукция: «я указал не использовать эти кадры — ты всё
+    равно их вставил»)."""
+    from core.fpv import _split_excluding_technical
+    tech = [Zone(project_id="p", video_id="v", start=60.0, end=90.0,
+                technical=True, required=False)]
+    assert _split_excluding_technical(65.0, 85.0, tech) == []
+
+
+def test_split_excluding_technical_no_overlap():
+    from core.fpv import _split_excluding_technical
+    tech = [Zone(project_id="p", video_id="v", start=200.0, end=210.0,
+                technical=True, required=False)]
+    assert _split_excluding_technical(65.0, 85.0, tech) == [(65.0, 85.0)]
+
+
+def test_split_excluding_technical_multiple_zones():
+    from core.fpv import _split_excluding_technical
+    tech = [
+        Zone(project_id="p", video_id="v", start=68.0, end=71.0, technical=True),
+        Zone(project_id="p", video_id="v", start=80.0, end=83.0, technical=True),
+    ]
+    assert _split_excluding_technical(65.0, 85.0, tech) == \
+        [(65.0, 68.0), (71.0, 80.0), (83.0, 85.0)]
+
+
+def test_fpv_plan_never_includes_technical_footage_mid_route(storage, synthetic_video, monkeypatch):
+    """Прямая репродукция жалобы: пауза между этажами явно помечена
+    технической — её footage не должно появляться в ролике ни на какой
+    скорости, а длинные зоны танца до/после должны дать несколько
+    нормально-скоростных моментов, а не один + гигантскую перемотку."""
+    import core.frame_quality as fq_mod
+    monkeypatch.setattr(fq_mod, "motion_profile", lambda *a, **k: None)
+
+    project = Project(name="dance2", target_duration=40, fpv_style="smooth")
+    storage.save_project(project)
+    video = SourceVideo(project_id=project.id, path=str(synthetic_video),
+                        duration=140.0, fps=30, width=640, height=360,
+                        fpv_showroom=True, valid=True)
+    storage.save_video(video)
+    scenes = []
+    for i in range(14):  # 0-140с
+        in_pause = 7 <= i <= 8  # 70-90с — техническая пауза
+        s = Scene(project_id=project.id, video_id=video.id,
+                 video_path=str(synthetic_video),
+                 start=i * 10.0, end=(i + 1) * 10.0,
+                 quality_score=0.6, llm_status="done",
+                 aesthetic_score=0.1 if in_pause else 0.7,
+                 people_count=0 if in_pause else (1 if i % 2 == 0 else 2),
+                 motion="static" if in_pause else "slow")
+        scenes.append(s)
+    storage.save_scenes(scenes)
+
+    floor1 = Zone(project_id=project.id, video_id=video.id, start=0.0, end=70.0,
+                 title="Танец на первом этаже", required=True, technical=False)
+    pause = Zone(project_id=project.id, video_id=video.id, start=70.0, end=90.0,
+                title="Переход на второй этаж", required=False, technical=True)
+    floor2 = Zone(project_id=project.id, video_id=video.id, start=90.0, end=140.0,
+                 title="Танец на втором этаже", required=True, technical=False)
+    for z in (floor1, pause, floor2):
+        storage.save_zone(z)
+
+    plan = build_fpv_plan(storage, project, video)
+
+    # техническая пауза не появляется в ролике ни на какой скорости
+    for seg in plan.segments:
+        overlap = min(seg.src_end, 90.0) - max(seg.src_start, 70.0)
+        assert overlap <= 0.01, f"сегмент {seg.src_start}-{seg.src_end} задел паузу"
+
+    # в каждом из этажей — больше одного нормально-скоростного момента,
+    # а не один показ + одна гигантская перемотка
+    floor1_normal = [s for s in plan.segments if s.speed == 1.0 and s.src_end <= 70.0]
+    floor2_normal = [s for s in plan.segments if s.speed == 1.0 and s.src_start >= 90.0]
+    assert len(floor1_normal) >= 2
+    assert len(floor2_normal) >= 2
+    # порядок маршрута не нарушен: всё строго по возрастанию
+    starts = [s.src_start for s in plan.segments]
+    assert starts == sorted(starts)
+
+
 # ─────────── скорость в модели ───────────
 
 def test_segment_out_duration():

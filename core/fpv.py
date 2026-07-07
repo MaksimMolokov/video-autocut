@@ -143,7 +143,8 @@ def _zones_from_raw(project: Project, video: SourceVideo, scenes: list[Scene],
 
 
 def _auto_zones(project: Project, video: SourceVideo, scenes: list[Scene],
-                route_start: float, route_end: float) -> list[Zone]:
+                route_start: float, route_end: float,
+                lane_width: float | None = None) -> list[Zone]:
     """Fallback без осмысленной группировки (LLM недоступен, или контент
     однородный — танец, спортивная съёмка, где нет «комнат»): маршрут делится
     на k равных полос, в каждой берётся самый «интересный» кусок — это и есть
@@ -153,11 +154,21 @@ def _auto_zones(project: Project, video: SourceVideo, scenes: list[Scene],
     группировка схлопывает всё в один блок) даёт ОДНУ гигантскую зону —
     и тогда почти весь ролик превращается в перемотку («видео всё дёрганое
     и перемотанное», как и было до этого фикса).
+
+    `lane_width` — фиксированная ширина полосы (сек); если задана, число
+    полос считается от неё, а не от project.target_duration. Используется
+    для деления ОДНОЙ длинной зоны на несколько моментов внутри неё же
+    (см. _expand_long_zones): длинный танец должен показать несколько
+    красивых кадров с перемоткой между ними, а не один момент + одна
+    гигантская перемотка до следующей комнаты.
     """
     span = route_end - route_start
     if span <= 0 or not scenes:
         return []
-    k = int(np.clip(round(project.target_duration / 10), 4, 10))
+    if lane_width:
+        k = max(1, round(span / lane_width))
+    else:
+        k = int(np.clip(round(project.target_duration / 10), 4, 10))
     lane = span / k
     subject_cache: dict = {}
     zones: list[Zone] = []
@@ -186,6 +197,51 @@ def _auto_zones(project: Project, video: SourceVideo, scenes: list[Scene],
             score=best_score, thumbnail_path=best.thumbnail_path,
         ))
     return zones
+
+
+def _expand_long_zones(project: Project, video: SourceVideo, scenes: list[Scene],
+                       zones: list[Zone], target_span: float) -> list[Zone]:
+    """Длинная зона (60с непрерывного танца, большой зал) не должна давать
+    ОДИН показ + одну гигантскую перемотку до следующей зоны — внутри неё
+    самой нужно найти несколько красивых моментов и перематывать МЕЖДУ ними.
+
+    Зона длиннее `target_span * 1.8` делится на несколько под-зон через
+    ту же логику интересности, что и _auto_zones (полосы + порог скуки),
+    но в границах САМОЙ этой зоны. Хуже одной интересной под-зоны — зона
+    остаётся как есть (не размножаем шум).
+    """
+    out: list[Zone] = []
+    for z in zones:
+        if z.duration <= target_span * 1.8:
+            out.append(z)
+            continue
+        subs = _auto_zones(project, video, scenes, z.start, z.end,
+                           lane_width=target_span)
+        out.extend(subs if len(subs) >= 2 else [z])
+    return out
+
+
+def _split_excluding_technical(start: float, end: float,
+                               technical_zones: list[Zone]) -> list[tuple[float, float]]:
+    """Режет интервал [start, end) на куски, вырезая пересечения с
+    техническими зонами — их footage не должно попадать в ролик ВООБЩЕ,
+    ни на нормальной, ни на перемоточной скорости (взлёт/посадка/пауза
+    между этажами и т.п., явно помеченные пользователем как «не для
+    монтажа»)."""
+    intervals = [(start, end)]
+    for tz in technical_zones:
+        next_intervals = []
+        for a, b in intervals:
+            lo, hi = max(a, tz.start), min(b, tz.end)
+            if lo < hi:
+                if a < lo:
+                    next_intervals.append((a, lo))
+                if hi < b:
+                    next_intervals.append((hi, b))
+            else:
+                next_intervals.append((a, b))
+        intervals = next_intervals
+    return [(a, b) for a, b in intervals if b - a >= _MIN_GAP_LEN]
 
 
 def detect_zones(storage, project: Project, video: SourceVideo) -> list[Zone]:
@@ -377,10 +433,30 @@ def build_fpv_plan(storage, project: Project, video: SourceVideo,
     if not required:
         required = active  # ничего не отмечено — показываем все зоны
 
-    sol = solve_timing([z.duration for z in required], route_end - route_start,
-                       project.target_duration, project.fpv_style)
+    # Технические зоны (взлёт/посадка/пауза между этажами — явно помечены
+    # пользователем «не для монтажа») вырезаются из ролика целиком, на
+    # любой скорости — не только на границах маршрута, но и в середине.
+    technical_zones = [z for z in zones if z.technical]
 
     scenes = sorted(storage.list_scenes_by_video(video.id), key=lambda s: s.start)
+
+    # Длинный непрерывный кусок (60с танца, большой зал) не должен давать
+    # ОДИН показ + одну гигантскую перемотку до следующей зоны — внутри
+    # него самого ищем несколько красивых моментов (см. _expand_long_zones).
+    target_span = style["window"][1] * 3.0
+    required = _expand_long_zones(project, video, scenes, required, target_span)
+    required.sort(key=lambda z: z.start)
+
+    # Технические куски физически не попадут в ролик (см. add_gap ниже) —
+    # тайминг-солвер должен считать маршрут БЕЗ них, иначе выделит на
+    # перемотку время, которое на деле пропадёт, и ролик выйдет короче target
+    technical_span = sum(
+        max(0.0, min(tz.end, route_end) - max(tz.start, route_start))
+        for tz in technical_zones)
+    route_len = (route_end - route_start) - technical_span
+
+    sol = solve_timing([z.duration for z in required], route_len,
+                       project.target_duration, project.fpv_style)
 
     # Позиция окна внутри зоны — плавный участок (плотный профиль движения)
     # И одновременно самый «интересный» (танцующий человек, красивая деталь):
@@ -421,16 +497,23 @@ def build_fpv_plan(storage, project: Project, video: SourceVideo,
                 return s
         return scenes[-1]
 
+    def add_gap(a: float, b: float, label: str):
+        """Перемотка [a,b), с вырезанными кусками технических зон — они не
+        должны появляться в ролике ни на какой скорости."""
+        nonlocal order
+        for lo, hi in _split_excluding_technical(a, b, technical_zones):
+            plan.segments.append(PlanSegment(
+                scene_id=scene_at(lo).id, order=order,
+                src_start=round(lo, 3), src_end=round(hi, 3),
+                slot=label, speed=sol.gap_speed, crop="smart",
+                reason=f"перемотка ×{sol.gap_speed:g} по маршруту"))
+            order += 1
+
     order = 0
     cursor = route_start
     for z, (w_start, w_end) in zip(required, windows):
         if w_start - cursor >= _MIN_GAP_LEN:   # перемотка до зоны
-            plan.segments.append(PlanSegment(
-                scene_id=scene_at(cursor).id, order=order,
-                src_start=round(cursor, 3), src_end=round(w_start, 3),
-                slot="переезд", speed=sol.gap_speed, crop="smart",
-                reason=f"перемотка ×{sol.gap_speed:g} по маршруту"))
-            order += 1
+            add_gap(cursor, w_start, "переезд")
         else:
             w_start = cursor  # микрозазор приклеиваем к зоне
         plan.segments.append(PlanSegment(
@@ -447,11 +530,7 @@ def build_fpv_plan(storage, project: Project, video: SourceVideo,
         # фактического курсора-окна) хвост маршрута молча пропадал каждый
         # раз, когда последняя показанная зона совпадала с концом активного
         # маршрута — локация оказывалась показана не до конца.
-        plan.segments.append(PlanSegment(
-            scene_id=scene_at(cursor).id, order=order,
-            src_start=round(cursor, 3), src_end=round(route_end, 3),
-            slot="финал", speed=sol.gap_speed, crop="smart",
-            reason=f"выход к финальной точке ×{sol.gap_speed:g}"))
+        add_gap(cursor, route_end, "финал")
 
     # Музыка: фрагмент под длительность, фейды; биты не снапим (скорости)
     if music is not None and project.music_path:
