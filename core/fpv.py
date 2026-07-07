@@ -67,24 +67,58 @@ _ZONES_SCHEMA = {
 }
 
 
-def _interest_score(s: Scene) -> float:
-    """Визуальная/содержательная ценность кадра: эстетика + люди в кадре +
-    техническое качество. Используется, чтобы выбирать «сюжеты» (танцующий
-    человек, красивая деталь), а не просто самый плавный участок."""
-    people_bonus = min(s.people_count, 2) / 2.0
-    return round(0.5 * (s.aesthetic_score or 0.0)
-                + 0.3 * people_bonus
-                + 0.2 * s.quality_score, 4)
+_MIN_ZONE_INTEREST = 0.15  # ниже — в кандидате нет ничего интересного (см. _auto_zones)
 
 
-def _window_interest(scenes: list[Scene], w_start: float, w_end: float) -> float:
+def _has_subject(s: Scene, cache: dict) -> bool:
+    """Есть ли в кадре человек/объект внимания — сначала доверяем LLM
+    (people_count), но если она молчит, проверяем настоящими CV-детекторами
+    (лица/силуэты по core.smart_crop). Это нужно, потому что: 1) без LM
+    Studio people_count всегда 0 у всех сцен; 2) даже при работающей LLM
+    она смотрит один кадр сцены и может не заметить танцующего человека
+    в динамичной позе — а CV-детектор проверяет несколько кадров отдельно."""
+    if s.people_count > 0:
+        return True
+    if s.id in cache:
+        return cache[s.id]
+    from core.smart_crop import find_focus
+    found = find_focus(s.video_path, s.start, s.end) is not None
+    cache[s.id] = found
+    return found
+
+
+def _interest_score(s: Scene, subject_cache: dict | None = None) -> float:
+    """Визуальная/содержательная ценность кадра — чтобы выбирать «сюжеты»
+    (танцующий человек, красивая деталь), а не просто самый технически
+    чистый участок.
+
+    Намеренно НЕ использует quality_score как основной вклад: статичный
+    завис дрона над пустым садом технически «чище» (нет смаза, нет тряски),
+    чем динамичный кадр с человеком — раньше это приводило к тому, что
+    алгоритм выбирал скучную паузу «сюжетом», а танец отправлял в перемотку.
+    Статичный кадр БЕЗ обнаруженного субъекта штрафуется явно.
+    """
+    has_subject = _has_subject(s, subject_cache) if subject_cache is not None \
+        else s.people_count > 0
+    subject_bonus = (min(s.people_count, 2) / 2.0 if s.people_count > 0
+                     else (1.0 if has_subject else 0.0))
+    score = (0.45 * (s.aesthetic_score or 0.0)
+            + 0.40 * subject_bonus
+            + 0.15 * s.quality_score)
+    if s.motion == "static" and not has_subject:
+        score *= 0.25  # статика без людей — почти всегда «ничего не происходит»
+    return round(score, 4)
+
+
+def _window_interest(scenes: list[Scene], w_start: float, w_end: float,
+                     subject_cache: dict | None = None) -> float:
     """Средняя интересность окна, взвешенная по перекрытию со сценами."""
     total, acc = 0.0, 0.0
     for s in scenes:
         ov = min(w_end, s.end) - max(w_start, s.start)
         if ov > 0:
             total += ov
-            acc += ov * _interest_score(s)
+            acc += ov * _interest_score(s, subject_cache)
     return acc / total if total > 0 else 0.0
 
 
@@ -125,6 +159,7 @@ def _auto_zones(project: Project, video: SourceVideo, scenes: list[Scene],
         return []
     k = int(np.clip(round(project.target_duration / 10), 4, 10))
     lane = span / k
+    subject_cache: dict = {}
     zones: list[Zone] = []
     last_scene_id = None
     for i in range(k):
@@ -132,7 +167,13 @@ def _auto_zones(project: Project, video: SourceVideo, scenes: list[Scene],
         chunk = [s for s in scenes if s.end > lo and s.start < hi]
         if not chunk:
             continue
-        best = max(chunk, key=_interest_score)
+        best = max(chunk, key=lambda sc: _interest_score(sc, subject_cache))
+        best_score = _interest_score(best, subject_cache)
+        if best_score < _MIN_ZONE_INTEREST:
+            # во всей полосе нет ничего интересного (пустой статичный кадр,
+            # завис дрон) — не делаем из неё «обязательный сюжет», пусть
+            # целиком станет перемоткой между соседними зонами
+            continue
         if best.id == last_scene_id:
             continue  # соседняя полоса выбрала тот же кусок — не дублируем
         last_scene_id = best.id
@@ -142,7 +183,7 @@ def _auto_zones(project: Project, video: SourceVideo, scenes: list[Scene],
             project_id=project.id, video_id=video.id,
             start=best.start, end=best.end, title=title or f"момент {i + 1}",
             technical=False, required=True,
-            score=_interest_score(best), thumbnail_path=best.thumbnail_path,
+            score=best_score, thumbnail_path=best.thumbnail_path,
         ))
     return zones
 
@@ -345,6 +386,7 @@ def build_fpv_plan(storage, project: Project, video: SourceVideo,
     # И одновременно самый «интересный» (танцующий человек, красивая деталь):
     # смаз/рывок штрафуется жёстко, интересность — тай-брейк среди плавных.
     profile = motion_profile(video.path, route_start, route_end)
+    subject_cache: dict = {}
 
     def best_window(z: Zone, w: float) -> tuple[float, float]:
         w = min(w, z.duration)
@@ -359,7 +401,7 @@ def build_fpv_plan(storage, project: Project, video: SourceVideo,
                 times, vecs = profile
                 ok, bad = window_motion_ok(times, vecs, st, st + w)
                 motion_bad = bad if ok else bad + 50  # дёрганое — в конец очереди
-            interest = _window_interest(scenes, st, st + w)
+            interest = _window_interest(scenes, st, st + w, subject_cache)
             score = motion_bad - 8.0 * interest  # среди плавных выигрывает интересное
             if score < best_score:
                 best, best_score = float(st), score

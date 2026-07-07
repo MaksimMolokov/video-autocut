@@ -197,6 +197,49 @@ def test_auto_zones_spread_across_long_uniform_route(storage, synthetic_video):
     assert all(z.duration < 100 for z in zones)
 
 
+def test_interest_score_penalizes_static_no_subject():
+    """Регрессия: статичный технически «чистый» кадр без людей (завис
+    дрона) не должен побеждать по интересности человека в динамике, даже
+    если у него ХУЖЕ формальное качество (смаз/шум от движения)."""
+    from core.fpv import _interest_score
+    boring_static = Scene(video_id="v", video_path="/x.mp4", start=0, end=10,
+                          aesthetic_score=0.0, quality_score=0.9,
+                          people_count=0, motion="static")
+    dancer = Scene(video_id="v", video_path="/x.mp4", start=0, end=10,
+                  aesthetic_score=0.3, quality_score=0.5,
+                  people_count=1, motion="fast")
+    cache: dict = {}
+    assert _interest_score(dancer, cache) > _interest_score(boring_static, cache)
+    assert _interest_score(boring_static, cache) < 0.15  # ниже порога зоны
+
+
+def test_auto_zones_skip_lane_with_only_boring_static_content():
+    """Полоса, где нет ничего кроме статичного зависшего кадра без людей,
+    не должна становиться обязательной зоной — вся полоса уходит в
+    перемотку. Прямая репродукция жалобы: «пауза без человека в саду —
+    почему это не перематывается»."""
+    from core.fpv import _auto_zones
+    project = Project(name="p", target_duration=60)
+    video = SourceVideo(project_id="p", path="/x.mp4")
+    scenes = []
+    for i in range(6):
+        if i == 1:
+            s = Scene(video_id="v", video_path="/x.mp4", start=10, end=20,
+                     aesthetic_score=0.0, quality_score=0.95,
+                     people_count=0, motion="static")
+        else:
+            s = Scene(video_id="v", video_path="/x.mp4",
+                     start=i * 10.0, end=(i + 1) * 10.0,
+                     aesthetic_score=0.6, quality_score=0.5,
+                     people_count=1, motion="fast")
+        scenes.append(s)
+    zones = _auto_zones(project, video, scenes, 0.0, 60.0)
+    # лана 10-20с (только скучная статика, единственный кандидат в ней —
+    # ровно этот кусок) не должна дать зону
+    assert not any(z.start == 10.0 for z in zones)
+    assert len(zones) == 5  # остальные 5 лан (с людьми) дали зоны
+
+
 def test_auto_zones_skips_duplicate_adjacent_scene():
     from core.fpv import _auto_zones
     project = Project(name="p", target_duration=40)
