@@ -142,14 +142,15 @@ def render_plan(storage: Storage, project: Project, plan: MontagePlan,
         key = hashlib.md5(
             f"{seg.scene_id}:{seg.src_start:.3f}:{seg.src_end:.3f}:"
             f"{w}x{h}@{out_fps}:{'f' if final else 'p'}:{cw}x{ch}+{x}+{y}"
-            f"{':stab' if stab else ''}".encode()
+            f"{':stab' if stab else ''}"
+            f"{f':x{seg.speed:g}' if seg.speed != 1.0 else ''}".encode()
         ).hexdigest()[:16]
         part = seg_cache / f"{key}.mp4"
 
         if part.exists():
             part.touch()  # обновляем mtime для LRU
             parts.append(part)
-            part_durs.append(seg.duration)
+            part_durs.append(seg.out_duration)
             progress(f"  сегмент {seg.order + 1}/{len(plan.segments)} [{seg.slot}] из кэша")
             continue
 
@@ -170,6 +171,9 @@ def render_plan(storage: Storage, project: Project, plan: MontagePlan,
                 vf += f",vidstabtransform=input={trf}:zoom=5:smoothing=25"
             else:
                 vf += f",deshake=rx=32:ry=32,crop={zw}:{zh},scale={w}:{h}"
+        if seg.speed != 1.0:
+            # перемотка FPV: сжимаем время, fps после setpts выравнивает кадры
+            vf += f",setpts=PTS/{seg.speed:g}"
         vf += f",setsar=1,fps={out_fps}"
         cmd = [
             "ffmpeg", "-y", "-v", "error",
@@ -184,11 +188,12 @@ def render_plan(storage: Storage, project: Project, plan: MontagePlan,
             progress(f"  ⚠️ сегмент {seg.order + 1} пропущен (ошибка ffmpeg) — ролик будет короче")
             continue
         parts.append(part)
-        part_durs.append(seg.duration)
+        part_durs.append(seg.out_duration)
         face_note = " 👤" if focus else ""
         stab_note = " 🩹" if stab else ""
+        speed_note = f" ×{seg.speed:g}" if seg.speed != 1.0 else ""
         progress(f"  сегмент {seg.order + 1}/{len(plan.segments)} [{seg.slot}] "
-                 f"{seg.duration:.1f}s{face_note}{stab_note}")
+                 f"{seg.out_duration:.1f}s{speed_note}{face_note}{stab_note}")
 
     if not parts:
         return None

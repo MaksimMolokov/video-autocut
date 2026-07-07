@@ -143,6 +143,57 @@ def cmd_render(args):
     storage.save_project(project)
 
 
+def cmd_zones(args):
+    """Зоны маршрута FPV-файлов: детекция и просмотр."""
+    from core.fpv import detect_zones
+    storage = Storage()
+    project = _resolve_project(storage, args.project)
+    for video in storage.list_videos(project.id):
+        if not video.fpv_showroom:
+            continue
+        from pathlib import Path as _P
+        print(f"\n🚁 {_P(video.path).name}")
+        zones = storage.list_zones(video.id)
+        if args.detect or not zones:
+            zones = detect_zones(storage, project, video)
+        for z in zones:
+            flags = ("⚙️техн." if z.technical else "") + ("★" if z.required else "")
+            print(f"  {z.start:7.1f}–{z.end:7.1f}s ({z.duration:5.1f}s) "
+                  f"score={z.score:.2f} {flags:<8} {z.title}")
+
+
+def cmd_fpv_plan(args):
+    """Сборка showroom-плана по FPV-файлу."""
+    from core.audio_analyzer import analyze_music_cached
+    from core.fpv import build_fpv_plan
+    storage = Storage()
+    project = _resolve_project(storage, args.project)
+    if args.style:
+        project.fpv_style = args.style
+    if args.duration:
+        project.target_duration = args.duration
+    if args.music:
+        project.music_path = args.music
+    storage.save_project(project)
+    fpv_videos = [v for v in storage.list_videos(project.id) if v.fpv_showroom]
+    if not fpv_videos:
+        sys.exit("Нет файлов, помеченных FPV showroom")
+    music = None
+    if project.music_path:
+        music = analyze_music_cached(storage, project.music_path)
+    plan = build_fpv_plan(storage, project, fpv_videos[0], music)
+    storage.save_plan(plan)
+    for wmsg in plan.warnings:
+        print(f"⚠️ {wmsg}")
+    print(f"\nFPV-план {plan.id} — {plan.total_duration:.1f}s из {project.target_duration}s:")
+    t = 0.0
+    for seg in plan.segments:
+        sp = f"×{seg.speed:g}" if seg.speed != 1 else "  "
+        print(f"  {t:5.1f}s {sp:>5} [{seg.slot:<24}] {seg.out_duration:4.1f}s  {seg.reason[:50]}")
+        t += seg.out_duration
+    print(f"\nРендер: python3 cli.py render --project {project.id}")
+
+
 def cmd_presets(_args):
     from core.presets import PRESETS
     for p in PRESETS.values():
@@ -196,6 +247,18 @@ def main():
     r.add_argument("--project", default=None)
     r.add_argument("--final", action="store_true", help="финальный экспорт (иначе preview)")
     r.set_defaults(func=cmd_render)
+
+    z = sub.add_parser("zones", help="зоны маршрута FPV-файлов")
+    z.add_argument("--project", default=None)
+    z.add_argument("--detect", action="store_true", help="передетектировать зоны")
+    z.set_defaults(func=cmd_zones)
+
+    fp = sub.add_parser("fpv-plan", help="собрать FPV showroom-план")
+    fp.add_argument("--project", default=None)
+    fp.add_argument("--style", choices=["smooth", "dynamic", "premium"], default=None)
+    fp.add_argument("--duration", type=int, default=None)
+    fp.add_argument("--music", default=None)
+    fp.set_defaults(func=cmd_fpv_plan)
 
     ps = sub.add_parser("presets", help="список пресетов")
     ps.set_defaults(func=cmd_presets)

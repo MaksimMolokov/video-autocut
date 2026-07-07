@@ -306,6 +306,25 @@ if step == "material":
     # Сводка и переход
     st.divider()
     videos_now = collect_video_files(project.source_paths) if project.source_paths else []
+
+    # 🚁 FPV showroom: пометка цельных однодублевых облётов (спека FPV)
+    if videos_now:
+        st.markdown("**🚁 FPV Showroom** <span style='color:#3B4A59;font-size:.8rem;'>"
+                    "— отметьте файлы, снятые одним дублем-облётом локации: "
+                    "система сохранит маршрут и смонтирует обзор с перемоткой</span>",
+                    unsafe_allow_html=True)
+        fpv_now = set(project.fpv_files)
+        changed = False
+        for vp in videos_now:
+            marked = st.checkbox(f"🚁 {vp.name}", value=str(vp) in fpv_now,
+                                 key=f"fpv_{vp}")
+            if marked and str(vp) not in fpv_now:
+                fpv_now.add(str(vp)); changed = True
+            elif not marked and str(vp) in fpv_now:
+                fpv_now.discard(str(vp)); changed = True
+        if changed:
+            project.fpv_files = sorted(fpv_now)
+            storage.save_project(project)
     s1, s2, s3 = st.columns(3)
     s1.metric("Видео", len(videos_now))
     s2.metric("Музыка", "✓" if project.music_path else "—")
@@ -551,6 +570,78 @@ elif step == "draft":
     ready = [s for s in scenes if s.user_flag != "banned"]
     plan = storage.latest_plan(project.id)
 
+    # ── 🚁 FPV Showroom: зоны маршрута, стиль, сборка ──
+    fpv_videos = [v for v in storage.list_videos(project.id) if v.fpv_showroom]
+    if fpv_videos:
+        with st.expander("🚁 FPV Showroom — обзор локации одним маршрутом",
+                         expanded=plan is None or plan.mode == "fpv"):
+            from core.fpv import STYLES, build_fpv_plan, detect_zones
+            video = fpv_videos[0]
+            if len(fpv_videos) > 1:
+                names = {Path(v.path).name: v for v in fpv_videos}
+                video = names[st.selectbox("FPV-файл", list(names))]
+
+            zones = storage.list_zones(video.id)
+            zc1, zc2 = st.columns([1, 3])
+            if zc1.button("🔍 Найти зоны" if not zones else "🔄 Передетектировать"):
+                with st.spinner("Детекция зон маршрута…"):
+                    zones = detect_zones(storage, project, video)
+                st.rerun()
+
+            if zones:
+                st.caption("Отметьте обязательные зоны; технические (взлёт/посадка) "
+                           "исключаются из ролика. Границы можно поправить.")
+                for z in zones:
+                    c_img, c_body = st.columns([1, 4])
+                    if z.thumbnail_path and Path(z.thumbnail_path).exists():
+                        c_img.image(z.thumbnail_path, use_container_width=True)
+                    with c_body:
+                        r1 = st.columns([3, 1, 1, 1, 1])
+                        new_title = r1[0].text_input("Название", z.title,
+                                                     key=f"zt_{z.id}",
+                                                     label_visibility="collapsed")
+                        req = r1[1].checkbox("★ обяз.", z.required, key=f"zr_{z.id}")
+                        tech = r1[2].checkbox("⚙️ техн.", z.technical, key=f"zx_{z.id}")
+                        zs = r1[3].number_input("нач.", value=float(z.start),
+                                                step=1.0, key=f"zs_{z.id}",
+                                                label_visibility="collapsed")
+                        ze = r1[4].number_input("кон.", value=float(z.end),
+                                                step=1.0, key=f"ze_{z.id}",
+                                                label_visibility="collapsed")
+                        st.caption(f"{z.start:.0f}–{z.end:.0f}с · {z.duration:.0f}с · "
+                                   f"ценность {z.score:.2f}")
+                        if (new_title != z.title or req != z.required
+                                or tech != z.technical
+                                or abs(zs - z.start) > 0.01 or abs(ze - z.end) > 0.01):
+                            z.title, z.required, z.technical = new_title, req, tech
+                            if ze > zs:
+                                z.start, z.end = float(zs), float(ze)
+                            storage.save_zone(z)
+
+                s_col1, s_col2 = st.columns([2, 1])
+                style_id = s_col1.radio(
+                    "Стиль showroom", list(STYLES),
+                    index=list(STYLES).index(project.fpv_style)
+                    if project.fpv_style in STYLES else 0,
+                    format_func=lambda k: STYLES[k]["title"], horizontal=True)
+                if s_col2.button("🚁 Собрать showroom", type="primary",
+                                 use_container_width=True):
+                    project.fpv_style = style_id
+                    storage.save_project(project)
+                    with st.spinner("FPV-план и рендер…"):
+                        music = None
+                        if project.music_path and Path(project.music_path).exists():
+                            music = analyze_music_cached(storage, project.music_path)
+                        fplan = build_fpv_plan(storage, project, video, music)
+                        storage.save_plan(fplan)
+                        render_plan(storage, project, fplan, final=False,
+                                    progress=lambda m: None)
+                    st.rerun()
+
+            if plan and plan.mode == "fpv" and plan.warnings:
+                for wmsg in plan.warnings:
+                    st.warning(wmsg)
+
     def _rebuild(variant: int):
         with st.spinner("Монтажный план…"):
             music = None
@@ -591,14 +682,17 @@ elif step == "draft":
         total = max(plan.total_duration, 0.1)
         segs_html = ""
         for seg in plan.segments:
-            w = max(seg.duration / total * 100, 3)
+            w = max(seg.out_duration / total * 100, 3)
             color = SLOT_COLORS.get(seg.slot, "#8A9BAE")
+            if seg.speed > 1.0:
+                color = "#3B4A59"  # перемотка — приглушённый блок
             beat = " ♪" if seg.beat_synced else ""
+            speed = f" ×{seg.speed:g}" if seg.speed != 1.0 else ""
             segs_html += (
                 f'<div class="tl-seg" style="width:{w:.1f}%;background:{color};" '
-                f'title="{seg.slot} · {seg.duration:.1f}s">'
-                f'<span>{seg.slot}{beat}</span>'
-                f'<span class="tl-seg-dur">{seg.duration:.1f}s</span></div>')
+                f'title="{seg.slot} · {seg.out_duration:.1f}s{speed}">'
+                f'<span>{seg.slot}{speed}{beat}</span>'
+                f'<span class="tl-seg-dur">{seg.out_duration:.1f}s</span></div>')
         audio_row = ('<div class="tl-track-label">Audio</div>'
                      '<div class="tl-audio-row"><div class="tl-audio-wave"></div></div>'
                      ) if project.music_path else ""
@@ -609,7 +703,7 @@ elif step == "draft":
             unsafe_allow_html=True)
 
         # Миниатюры сегментов
-        tl_cols = st.columns([max(seg.duration, 0.5) for seg in plan.segments])
+        tl_cols = st.columns([max(seg.out_duration, 0.5) for seg in plan.segments])
         for col, seg in zip(tl_cols, plan.segments):
             sc = storage.get_scene(seg.scene_id)
             with col:

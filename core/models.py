@@ -48,6 +48,9 @@ class Project:
     stabilize_shaky: bool = False
     # Опция: анализ речи Whisper — не резать склейками посреди фразы
     analyze_speech: bool = True
+    # FPV Showroom: пути файлов, помеченных как цельный однодублевый облёт
+    fpv_files: list[str] = field(default_factory=list)
+    fpv_style: str = "smooth"   # smooth | dynamic | premium
     status: str = "new"        # new | analyzing | analyzed | planned | rendered
     analysis_progress: str = ""  # живой статус фонового воркера для UI
 
@@ -73,6 +76,7 @@ class SourceVideo:
     error: str = ""
     file_hash: str = ""        # быстрый отпечаток файла — кэш анализа
     speech_segments: list = field(default_factory=list)  # [[start, end, text], …]
+    fpv_showroom: bool = False # цельный FPV-облёт локации одним дублем
 
 
 @dataclass
@@ -147,15 +151,41 @@ class PlanSegment:
     order: int                 # позиция в ролике
     src_start: float           # таймкоды в исходнике
     src_end: float
-    slot: str                  # место в структуре (STORY_SLOTS)
+    slot: str                  # место в структуре (STORY_SLOTS) или имя зоны FPV
     reason: str = ""           # причина выбора — обязательна для прозрачности
     id: str = field(default_factory=_new_id)
     crop: str = "center"       # рекомендация кадрирования
     beat_synced: bool = False  # склейка выровнена по биту
+    speed: float = 1.0         # скорость воспроизведения (FPV: перемотка промежутков)
 
     @property
     def duration(self) -> float:
+        """Длительность в ИСХОДНИКЕ, сек."""
         return round(self.src_end - self.src_start, 3)
+
+    @property
+    def out_duration(self) -> float:
+        """Длительность в РОЛИКЕ с учётом скорости, сек."""
+        return round((self.src_end - self.src_start) / max(self.speed, 0.01), 3)
+
+
+@dataclass
+class Zone:
+    """Ключевая зона маршрута внутри FPV showroom-файла."""
+    project_id: str
+    video_id: str
+    start: float               # таймкоды в исходнике
+    end: float
+    title: str = ""            # «вход», «барная зона», …
+    id: str = field(default_factory=_new_id)
+    required: bool = True      # обязательно показать в ролике
+    technical: bool = False    # взлёт/посадка/настройка — исключается
+    score: float = 0.0         # визуальная ценность 0..1
+    thumbnail_path: str = ""
+
+    @property
+    def duration(self) -> float:
+        return round(self.end - self.start, 3)
 
 
 @dataclass
@@ -174,10 +204,13 @@ class MontagePlan:
     # Переход между сценами (из пресета)
     transition: str = "cut"            # cut | crossfade
     transition_duration: float = 0.0
+    mode: str = "standard"             # standard | fpv — showroom-план
+    warnings: list[str] = field(default_factory=list)  # тайминг не влез и т.п.
     status: str = "draft"      # draft | rendered | final
     preview_path: str = ""
     export_path: str = ""
 
     @property
     def total_duration(self) -> float:
-        return round(sum(s.duration for s in self.segments), 3)
+        """Длительность РОЛИКА (с учётом скоростей сегментов)."""
+        return round(sum(s.out_duration for s in self.segments), 3)

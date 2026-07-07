@@ -71,6 +71,7 @@ def analyze_project(storage: Storage, project: Project,
         # 2. Теханализ
         video = video_analyzer.probe_video(project.id, f)
         video.file_hash = fp
+        video.fpv_showroom = str(f) in project.fpv_files  # пометка юзера
         if not video.valid:
             storage.save_video(video)
             progress(f"  ⚠️ пропущен ({video.error})")
@@ -173,4 +174,14 @@ def run_llm_analysis(storage: Storage, project: Project,
                      f"{scene.description[:60]}…")
         storage.save_scene(scene)
     progress(f"LLM-анализ завершён: {done}/{len(pending)}")
+
+    # FPV showroom: после описаний строим зоны маршрута для помеченных файлов
+    from core.fpv import detect_zones
+    for video in storage.list_videos(project.id):
+        if video.fpv_showroom and video.valid:
+            progress(f"🚁 Детекция зон маршрута: {Path(video.path).name}…")
+            zones = detect_zones(storage, project, video)
+            progress(f"  найдено зон: {len(zones)}"
+                     + (f" (техн.: {sum(1 for z in zones if z.technical)})"
+                        if zones else ""))
     return done

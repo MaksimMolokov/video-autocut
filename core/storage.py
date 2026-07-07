@@ -14,7 +14,7 @@ from dataclasses import asdict, fields
 from pathlib import Path
 
 import config
-from core.models import MontagePlan, PlanSegment, Project, Scene, SourceVideo
+from core.models import MontagePlan, PlanSegment, Project, Scene, SourceVideo, Zone
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
@@ -57,6 +57,13 @@ CREATE TABLE IF NOT EXISTS music_cache (   -- кэш анализа музыки
     key TEXT PRIMARY KEY,                  -- путь + mtime + размер
     data TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS zones (         -- зоны маршрута FPV showroom
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    video_id TEXT NOT NULL,
+    data TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_zones_video ON zones(video_id);
 CREATE INDEX IF NOT EXISTS idx_scenes_project ON scenes(project_id);
 CREATE INDEX IF NOT EXISTS idx_scenes_video ON scenes(video_id);
 CREATE INDEX IF NOT EXISTS idx_videos_project ON videos(project_id);
@@ -123,7 +130,7 @@ class Storage:
             self.conn.execute(
                 "DELETE FROM replacements WHERE plan_id IN "
                 "(SELECT id FROM plans WHERE project_id=?)", (project_id,))
-            for table in ("scenes", "videos", "plans"):
+            for table in ("scenes", "videos", "plans", "zones"):
                 self.conn.execute(f"DELETE FROM {table} WHERE project_id=?",  # noqa: S608 — имена фиксированы
                                   (project_id,))
             self.conn.execute("DELETE FROM projects WHERE id=?", (project_id,))
@@ -187,12 +194,31 @@ class Storage:
         """Удаляет запись видео вместе с его сценами (переанализ файла)."""
         with self._lock:
             self.conn.execute("DELETE FROM scenes WHERE video_id=?", (video_id,))
+            self.conn.execute("DELETE FROM zones WHERE video_id=?", (video_id,))
             self.conn.execute("DELETE FROM videos WHERE id=?", (video_id,))
             self.conn.commit()
 
     def list_scenes_by_video(self, video_id: str) -> list[Scene]:
         rows = self._query("SELECT data FROM scenes WHERE video_id=?", (video_id,))
         return [_load(Scene, r[0]) for r in rows]
+
+    # --- Зоны FPV showroom ---
+    def save_zone(self, z: Zone):
+        self._write("INSERT OR REPLACE INTO zones VALUES (?,?,?,?)",
+                    (z.id, z.project_id, z.video_id,
+                     json.dumps(asdict(z), ensure_ascii=False)))
+
+    def list_zones(self, video_id: str) -> list[Zone]:
+        rows = self._query("SELECT data FROM zones WHERE video_id=?", (video_id,))
+        zones = [_load(Zone, r[0]) for r in rows]
+        zones.sort(key=lambda z: z.start)
+        return zones
+
+    def delete_zones_for_video(self, video_id: str):
+        self._write("DELETE FROM zones WHERE video_id=?", (video_id,))
+
+    def delete_zone(self, zone_id: str):
+        self._write("DELETE FROM zones WHERE id=?", (zone_id,))
 
     # --- Кэш анализа музыки ---
     def get_music_cache(self, key: str) -> str | None:
