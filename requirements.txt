@@ -7,6 +7,7 @@ pillow>=10.0
 
 # LLM (LM Studio OpenAI-совместимый API)
 openai>=1.30
+httpx>=0.23  # транспорт openai; тесты мокают ошибки соединения напрямую через httpx
 
 # Анализ музыки (Фаза 5)
 librosa>=0.10

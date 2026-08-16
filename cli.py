@@ -17,6 +17,13 @@ from core.models import Project
 from core.pipeline import analyze_project, run_llm_analysis
 from core.storage import Storage
 
+# Windows-консоль по умолчанию не в UTF-8 (cp1251/cp866) — кириллица и стрелки
+# (→, § и т.п.) в help/логах роняют print() с UnicodeEncodeError. На Mac/Linux
+# это no-op (там уже UTF-8).
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8")
+
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
 

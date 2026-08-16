@@ -2,6 +2,7 @@
 изолированное хранилище (PROJECTS_DIR → tmp)."""
 from __future__ import annotations
 
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -10,6 +11,27 @@ import pytest
 
 import config
 from core.storage import Storage
+
+# Юнит-тесты (чистая логика) должны быть зелёными на любой машине.
+# Интеграционные — те, что зависят (напрямую или транзитивно, через
+# project_with_plan/source_dir и т.п.) от одной из этих фикстур —
+# реально гоняют ffmpeg/ffprobe и требуют бинарники в PATH. Без них
+# честно скипаем с причиной вместо каскада FileNotFoundError.
+_FFMPEG_FIXTURES = {
+    "media_dir", "synthetic_video", "synthetic_music", "shaky_video",
+    "smooth_pan_video", "mixed_motion_video", "freeze_video",
+}
+_HAS_FFMPEG = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
+
+
+def pytest_collection_modifyitems(config, items):
+    if _HAS_FFMPEG:
+        return
+    skip = pytest.mark.skip(reason="ffmpeg/ffprobe не найден в PATH — "
+                                    "интеграционный тест пропущен")
+    for item in items:
+        if _FFMPEG_FIXTURES & set(item.fixturenames):
+            item.add_marker(skip)
 
 
 @pytest.fixture(scope="session")

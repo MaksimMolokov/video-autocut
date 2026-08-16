@@ -1,12 +1,13 @@
 """Лок фонового воркера анализа: один воркер на проект.
 
 pid-файл в папке проекта. Мёртвый процесс (краш, kill) оставляет lock —
-он определяется через os.kill(pid, 0) и считается несущественным (stale).
+он определяется через _pid_alive() и считается несущественным (stale).
 """
 from __future__ import annotations
 
 import logging
 import os
+import sys
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -19,6 +20,29 @@ def _lock_path(project_dir: Path) -> Path:
 
 
 def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        # os.kill(pid, 0) на Windows не бросает исключение для мёртвого pid
+        # (сигнал 0 там не значит «проверка существования»). OpenProcess()
+        # тоже недостаточен: хендл на PID открывается, даже если процесс уже
+        # завершился, пока PID не переиспользован ОС — нужен реальный
+        # exit-код через GetExitCodeProcess (STILL_ACTIVE = процесс жив).
+        import ctypes
+
+        STILL_ACTIVE = 259
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            exit_code = ctypes.c_ulong(0)
+            ok = ctypes.windll.kernel32.GetExitCodeProcess(
+                handle, ctypes.byref(exit_code))
+            return bool(ok) and exit_code.value == STILL_ACTIVE
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)  # сигнал 0 — только проверка существования
         return True

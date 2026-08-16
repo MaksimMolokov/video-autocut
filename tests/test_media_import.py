@@ -39,6 +39,9 @@ def test_collect_nonexistent_and_wrong_type(tmp_path):
 
 
 def test_collect_expands_user(tmp_path, monkeypatch):
+    # os.path.expanduser читает HOME на POSIX и USERPROFILE на Windows —
+    # выставляем оба, чтобы тест не зависел от платформы.
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     (tmp_path / "v.mp4").touch()
     assert len(collect_video_files(["~/v.mp4"])) == 1

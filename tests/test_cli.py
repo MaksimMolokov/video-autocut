@@ -7,8 +7,11 @@ ROOT = Path(__file__).parent.parent
 
 
 def _run(*args):
+    # cli.py всегда пишет stdout/stderr в UTF-8 (см. cli.py) — декодируем тем же
+    # кодеком явно, не полагаясь на locale-кодировку текущей консоли/CI-агента.
     return subprocess.run([sys.executable, "cli.py", *args],
-                          capture_output=True, text=True, cwd=ROOT, timeout=120)
+                          capture_output=True, text=True, encoding="utf-8",
+                          cwd=ROOT, timeout=120)
 
 
 def test_presets_command():
