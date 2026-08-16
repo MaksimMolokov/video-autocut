@@ -51,6 +51,9 @@ class Project:
     # FPV Showroom: пути файлов, помеченных как цельный однодублевый облёт
     fpv_files: list[str] = field(default_factory=list)
     fpv_style: str = "smooth"   # smooth | dynamic | premium
+    # Длительная статичная пауза (картинка не меняется, людей нет) сжимается
+    # так, чтобы в ролике занимать не больше этого времени, сек
+    fpv_pause_out: float = 0.5
     status: str = "new"        # new | analyzing | analyzed | planned | rendered
     analysis_progress: str = ""  # живой статус фонового воркера для UI
 
@@ -119,6 +122,8 @@ class Scene:
     recommended_slot: str = ""      # из STORY_SLOTS
     recommendation_reason: str = ""
     scenario_match_score: float = 0.0   # заполняет Scene Matcher (Фаза 6)
+    scenario_match_key: str = ""    # хэш сценария, для которого посчитан score —
+                                    # ранжирование не пересчитывается зря
     llm_status: str = "pending"     # pending | done | failed | skipped
 
     # Пользовательские пометки (ТЗ §15)

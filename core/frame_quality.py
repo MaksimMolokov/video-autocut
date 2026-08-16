@@ -178,6 +178,42 @@ def window_motion_ok(times: np.ndarray, vecs: np.ndarray,
     return ok, round(badness, 3)
 
 
+_CHANGE_FPS = 8      # замеров/с — достаточно для детекции пауз
+
+
+def change_profile(path: str, start: float, end: float
+                   ) -> tuple[np.ndarray, np.ndarray] | None:
+    """Средняя пофреймовая разница картинки: «меняется ли картинка вообще».
+
+    В отличие от motion_profile (глобальный сдвиг камеры), ловит ЛЮБОЕ
+    изменение: танцующий человек при статичной камере даёт большую разницу,
+    полностью замерший кадр (дрон завис, ничего не происходит) — почти ноль.
+    Возвращает (times, diffs): diffs — средний |Δpixel| 0..255 между
+    соседними кадрами. None — декодировать не удалось.
+    """
+    import subprocess
+    h = int(_DENSE_W * 9 / 16 / 2) * 2
+    cmd = [
+        "ffmpeg", "-v", "error",
+        "-ss", f"{start:.3f}", "-i", path, "-t", f"{end - start:.3f}",
+        "-vf", f"fps={_CHANGE_FPS},scale={_DENSE_W}:{h}",
+        "-f", "rawvideo", "-pix_fmt", "gray", "-",
+    ]
+    try:
+        raw = subprocess.run(cmd, capture_output=True, timeout=300).stdout
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    frame_size = _DENSE_W * h
+    n = len(raw) // frame_size
+    if n < 3:
+        return None
+    frames = np.frombuffer(raw[:n * frame_size], dtype=np.uint8)
+    frames = frames.reshape(n, h, _DENSE_W).astype(np.float32)
+    diffs = np.abs(np.diff(frames, axis=0)).mean(axis=(1, 2))
+    times = start + (np.arange(n - 1) + 0.5) / _CHANGE_FPS
+    return times, diffs
+
+
 def _flow(prev: np.ndarray, curr: np.ndarray) -> np.ndarray | None:
     """Медианный вектор оптического потока между двумя кадрами (px/кадр)."""
     pts = cv2.goodFeaturesToTrack(prev, maxCorners=120, qualityLevel=0.01, minDistance=12)

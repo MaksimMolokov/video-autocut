@@ -195,5 +195,6 @@ class LLMAnalyzer:
         scene.subject_y = float(min(max(data.get("subject_y", 0.5) or 0.5, 0), 1))
         if not data.get("usable_for_edit", True):
             scene.tags.append("not-usable")
+        scene.scenario_match_key = ""  # описание изменилось — ранжирование заново
         scene.llm_status = "done"
         return True

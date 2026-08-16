@@ -30,10 +30,14 @@ _ALTERNATIVES_PER_SLOT = 4  # сколько запасных сцен хран�
 
 def build_plan(project: Project, scenes: list[Scene],
                music: MusicAnalysis | None = None,
-               use_llm: bool = True, variant: int = 0) -> MontagePlan:
+               use_llm: bool = True, variant: int = 0,
+               storage=None) -> MontagePlan:
     """variant=0 — детерминированный лучший план; variant>0 — «другой вариант»:
     топ-кандидаты слотов перемешиваются воспроизводимо (тот же variant —
-    тот же план), закреплённые сцены всегда остаются первыми."""
+    тот же план), закреплённые сцены всегда остаются первыми.
+
+    storage — для персистентного кэша LLM-ранжирования: скоры сцен под
+    неизменный сценарий не пересчитываются при каждой пересборке."""
     preset = get_preset(project.preset_id)
     scenario = project.scenario_text or preset.scenario_text()
 
@@ -57,7 +61,7 @@ def build_plan(project: Project, scenes: list[Scene],
 
     # LLM-уточнение соответствия сценарию (если доступно)
     if use_llm:
-        _llm_rank(scenario, usable)
+        _llm_rank(scenario, usable, storage)
 
     plan = MontagePlan(project_id=project.id)
     plan.transition = preset.transition
@@ -262,6 +266,34 @@ def _pick_fragment(scene: Scene, frag_len: float) -> tuple[float, float]:
     return round(start, 3), round(start + frag_len, 3)
 
 
+def _profile_path(scene: Scene):
+    """Файл персистентного кэша плотного профиля движения сцены."""
+    if not scene.project_id:
+        return None
+    return (config.PROJECTS_DIR / scene.project_id / "cache" / "profiles"
+            / f"{scene.id}.npz")
+
+
+def _load_or_build_profile(scene: Scene):
+    """Профиль движения: с диска, иначе считается ffmpeg-ом и сохраняется.
+    Профиль дорогой (декодирование всей сцены на 20 fps) — без кэша каждый
+    перезапуск приложения пересчитывал бы его при первой же сборке плана."""
+    from core.frame_quality import motion_profile
+
+    pf = _profile_path(scene)
+    if pf is not None and pf.exists():
+        try:
+            data = np.load(pf)
+            return data["times"], data["vecs"]
+        except Exception:  # битый файл — пересчитаем
+            pf.unlink(missing_ok=True)
+    profile = motion_profile(scene.video_path, scene.start, scene.end)
+    if profile is not None and pf is not None:
+        pf.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(pf, times=profile[0], vecs=profile[1])
+    return profile
+
+
 def _pick_best_window(scene: Scene, frag_len: float,
                       prefer_motion: list[str],
                       _cache: dict = {}) -> tuple[float, float] | None:  # noqa: B006 — межвызовной кэш
@@ -272,13 +304,15 @@ def _pick_best_window(scene: Scene, frag_len: float,
     Окно двигается с шагом 0.5с; выбирается самое плавное.
     None — вся сцена дёрганая, кандидат отклоняется целиком.
     """
-    from core.frame_quality import motion_profile, window_motion_ok
+    from core.frame_quality import window_motion_ok
 
+    if len(_cache) > 512:  # долгоживущий Streamlit-процесс — не копим бесконечно
+        _cache.clear()
     profile = _cache.get(scene.id)
     if profile is None:
-        profile = motion_profile(scene.video_path, scene.start, scene.end)
+        profile = _load_or_build_profile(scene)
         _cache[scene.id] = profile if profile is not None else "fail"
-    if profile == "fail" or profile is None:
+    if isinstance(profile, str) or profile is None:
         # декодер не справился — старый грубый путь (бёрсты)
         return _pick_fragment(scene, frag_len)
     times, vecs = profile
@@ -350,22 +384,29 @@ def _chunks(items: list, size: int) -> list[list]:
     return [items[i:i + size] for i in range(0, len(items), size)]
 
 
-def _llm_rank(scenario: str, scenes: list[Scene]) -> bool:
+def _llm_rank(scenario: str, scenes: list[Scene], storage=None) -> bool:
     """Просит LLM оценить соответствие карточек сцен сценарию (0..1).
 
     Работает с текстовыми карточками, а не с изображениями — быстрый запрос.
     Карточки уходят батчами по _RANK_BATCH, чтобы большая библиотека
     не упёрлась в контекст модели.
+    Скор кэшируется в сцене вместе с хэшем сценария (scenario_match_key):
+    пересборка плана с тем же сценарием не гоняет LLM повторно.
     При недоступности LM Studio молча пропускается (скоринг остаётся rule-based).
     """
+    import hashlib
+    scen_key = hashlib.md5(scenario.encode()).hexdigest()[:12]
+    todo = [s for s in scenes
+            if s.llm_status == "done" and s.scenario_match_key != scen_key]
+    if not todo:
+        return any(s.scenario_match_key == scen_key for s in scenes)
+
     llm = LLMAnalyzer()
     if not llm.is_available():
         log.info("LM Studio недоступен — ранжирование только rule-based")
         return False
 
-    cards = [s.llm_card() for s in scenes if s.llm_status == "done"]
-    if not cards:
-        return False
+    cards = [s.llm_card() for s in todo]
 
     schema = {
         "name": "scene_ranking", "strict": True,
@@ -407,7 +448,10 @@ def _llm_rank(scenario: str, scenes: list[Scene]) -> bool:
         log.warning("LLM-ранжирование не удалось (%s) — используется rule-based", e)
         if not by_id:
             return False
-    for s in scenes:
+    for s in todo:
         if s.id in by_id:
             s.scenario_match_score = min(max(by_id[s.id], 0.0), 1.0)
+            s.scenario_match_key = scen_key
+            if storage is not None:
+                storage.save_scene(s)
     return True

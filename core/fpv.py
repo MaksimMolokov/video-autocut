@@ -36,6 +36,14 @@ STYLES = {
 
 _MIN_GAP_SPEED = 1.0   # промежуток не замедляем
 _MIN_GAP_LEN = 0.4     # короче — приклеивается к соседней зоне
+_SUBJECT_GAP_MAX = 3.0  # предел перемотки по кадрам С ЛЮДЬМИ: танцор на ×8
+                        # выглядит категорически плохо; пустые промежутки
+                        # (дрон летит/завис между этажами) гонятся до gap_max
+_FREEZE_MIN_LEN = 2.5   # статичный кусок длиннее этого — «замёрзшая пауза»:
+                        # сжимается до project.fpv_pause_out экранных секунд
+                        # (по умолчанию 0.5с), быстрее любой перемотки
+_FREEZE_DIFF_MAX = 2.0  # средняя пофреймовая разница (0..255) ниже —
+                        # картинка «стоит» (шум сенсора/кодека даёт <1.5)
 
 
 # ─────────────────────────── Зоны ───────────────────────────
@@ -92,19 +100,18 @@ def _interest_score(s: Scene, subject_cache: dict | None = None) -> float:
     (танцующий человек, красивая деталь), а не просто самый технически
     чистый участок.
 
-    Намеренно НЕ использует quality_score как основной вклад: статичный
-    завис дрона над пустым садом технически «чище» (нет смаза, нет тряски),
-    чем динамичный кадр с человеком — раньше это приводило к тому, что
-    алгоритм выбирал скучную паузу «сюжетом», а танец отправлял в перемотку.
-    Статичный кадр БЕЗ обнаруженного субъекта штрафуется явно.
+    Человек в кадре ДОМИНИРУЕТ над эстетикой и качеством: сцена с танцором
+    всегда должна обыгрывать пустой кадр, каким бы красивым и технически
+    чистым тот ни был — иначе «сюжетом» становится завис дрона над пустым
+    залом, а танец уезжает в перемотку (реальная жалоба). quality_score
+    намеренно почти не участвует: статичный завис «чище» динамики по метрикам.
+    Статичный кадр БЕЗ обнаруженного субъекта дополнительно штрафуется.
     """
     has_subject = _has_subject(s, subject_cache) if subject_cache is not None \
         else s.people_count > 0
-    subject_bonus = (min(s.people_count, 2) / 2.0 if s.people_count > 0
-                     else (1.0 if has_subject else 0.0))
-    score = (0.45 * (s.aesthetic_score or 0.0)
-            + 0.40 * subject_bonus
-            + 0.15 * s.quality_score)
+    score = (0.55 * (1.0 if has_subject else 0.0)
+            + 0.35 * (s.aesthetic_score or 0.0)
+            + 0.10 * s.quality_score)
     if s.motion == "static" and not has_subject:
         score *= 0.25  # статика без людей — почти всегда «ничего не происходит»
     return round(score, 4)
@@ -120,6 +127,102 @@ def _window_interest(scenes: list[Scene], w_start: float, w_end: float,
             total += ov
             acc += ov * _interest_score(s, subject_cache)
     return acc / total if total > 0 else 0.0
+
+
+def _subject_spans(scenes: list[Scene], cache: dict,
+                   merge_gap: float = 2.0) -> list[tuple[float, float]]:
+    """Непрерывные интервалы «в кадре есть человек». Соседние сцены с людьми
+    сливаются (разрыв короче merge_gap — тот же танец/человек)."""
+    spans: list[list[float]] = []
+    for s in sorted(scenes, key=lambda x: x.start):
+        if not _has_subject(s, cache):
+            continue
+        if spans and s.start - spans[-1][1] <= merge_gap:
+            spans[-1][1] = max(spans[-1][1], s.end)
+        else:
+            spans.append([s.start, s.end])
+    return [(a, b) for a, b in spans]
+
+
+def _frozen_spans_profile(path: str, start: float, end: float,
+                          min_len: float = _FREEZE_MIN_LEN
+                          ) -> list[tuple[float, float]] | None:
+    """Паузы по честному замеру: пофреймовая разница картинки почти ноль
+    на протяжении min_len — картинка буквально не меняется.
+
+    Основной детектор пауз: не зависит от классификации сцен (лёгкий дрейф
+    дрона помечает сцену «slow» — и сценный детектор паузу пропускает) и от
+    CV-детекции людей (ложный «человек» в пустом кадре — пауза уходила в
+    щадящую перемотку). Замерший человек в позе тоже пауза: раз ничего не
+    меняется — держать это дольше настройки незачем.
+    None — декодировать не удалось (детекция по сценам остаётся fallback-ом).
+    """
+    from core.frame_quality import change_profile
+    prof = change_profile(path, start, end)
+    if prof is None:
+        return None
+    times, diffs = prof
+    k = max(int(0.5 * len(diffs) / max(times[-1] - times[0], 1e-6)), 1)
+    smooth = np.convolve(diffs, np.ones(k) / k, mode="same")  # окно ~0.5с
+    spans: list[tuple[float, float]] = []
+    run_start = None
+    for t, d in zip(times, smooth):
+        if d < _FREEZE_DIFF_MAX:
+            if run_start is None:
+                run_start = float(t)
+        elif run_start is not None:
+            if t - run_start >= min_len:
+                spans.append((run_start, float(t)))
+            run_start = None
+    if run_start is not None and times[-1] - run_start >= min_len:
+        spans.append((run_start, float(times[-1])))
+    return spans
+
+
+def _merge_spans(spans: list[tuple[float, float]],
+                 merge_gap: float = 0.5) -> list[tuple[float, float]]:
+    """Объединяет пересекающиеся/соседние интервалы."""
+    out: list[list[float]] = []
+    for lo, hi in sorted(spans):
+        if out and lo - out[-1][1] <= merge_gap:
+            out[-1][1] = max(out[-1][1], hi)
+        else:
+            out.append([lo, hi])
+    return [(a, b) for a, b in out]
+
+
+def _frozen_spans(scenes: list[Scene], cache: dict,
+                  min_len: float = _FREEZE_MIN_LEN) -> list[tuple[float, float]]:
+    """Интервалы «картинка не меняется»: подряд идущие статичные сцены без
+    людей. Длиннее min_len — «замёрзшая пауза» (дрон завис, ничего не
+    происходит): в ролике сжимается до фиксированной длительности."""
+    spans: list[list[float]] = []
+    for s in sorted(scenes, key=lambda x: x.start):
+        if s.motion != "static" or _has_subject(s, cache):
+            continue
+        if spans and s.start - spans[-1][1] <= 0.5:
+            spans[-1][1] = max(spans[-1][1], s.end)
+        else:
+            spans.append([s.start, s.end])
+    return [(a, b) for a, b in spans if b - a >= min_len]
+
+
+def _split_by_subject(a: float, b: float, spans: list[tuple[float, float]]
+                      ) -> list[tuple[float, float, bool]]:
+    """Интервал [a,b) → куски (lo, hi, есть_ли_люди) по subject-интервалам."""
+    parts: list[tuple[float, float, bool]] = []
+    cur = a
+    for lo, hi in spans:
+        lo, hi = max(lo, a), min(hi, b)
+        if lo >= hi:
+            continue
+        if cur < lo:
+            parts.append((cur, lo, False))
+        parts.append((lo, hi, True))
+        cur = hi
+    if cur < b:
+        parts.append((cur, b, False))
+    return parts
 
 
 def _zones_from_raw(project: Project, video: SourceVideo, scenes: list[Scene],
@@ -171,6 +274,12 @@ def _auto_zones(project: Project, video: SourceVideo, scenes: list[Scene],
         k = int(np.clip(round(project.target_duration / 10), 4, 10))
     lane = span / k
     subject_cache: dict = {}
+    # Если на маршруте вообще есть люди — сюжет ТОЛЬКО на людях: полоса без
+    # человека (пустой пролёт, завис между этажами) целиком уходит в
+    # перемотку, каким бы красивым ни был кадр. Локации без людей
+    # (пустой ресторан) работают по эстетике, как раньше.
+    route_scenes = [s for s in scenes if s.end > route_start and s.start < route_end]
+    route_has_people = any(_has_subject(s, subject_cache) for s in route_scenes)
     zones: list[Zone] = []
     last_scene_id = None
     for i in range(k):
@@ -185,6 +294,8 @@ def _auto_zones(project: Project, video: SourceVideo, scenes: list[Scene],
             # завис дрон) — не делаем из неё «обязательный сюжет», пусть
             # целиком станет перемоткой между соседними зонами
             continue
+        if route_has_people and not _has_subject(best, subject_cache):
+            continue  # люди в видео есть, а в этой полосе нет — перемотка
         if best.id == last_scene_id:
             continue  # соседняя полоса выбрала тот же кусок — не дублируем
         last_scene_id = best.id
@@ -364,18 +475,30 @@ def _detect_zones_fallback(scenes: list[Scene]) -> list[tuple[str, int, int, boo
 class TimingSolution:
     window: float          # длина окна обязательной зоны, сек исходника
     zone_speed: float      # скорость показа зон
-    gap_speed: float       # скорость промежутков
+    gap_speed: float       # скорость промежутков БЕЗ людей
     fits: bool             # уложились ли в target
     warnings: list[str]
+    subject_gap_speed: float = 1.0  # щадящая перемотка по кадрам С людьми
 
 
 def solve_timing(zone_lens: list[float], route_len: float,
-                 target: float, style: str) -> TimingSolution:
-    """Подбор окна зон и скорости промежутков под целевую длительность.
+                 target: float, style: str,
+                 subject_len: float = 0.0,
+                 frozen_len: float = 0.0,
+                 frozen_out: float = 0.0) -> TimingSolution:
+    """Подбор окна зон и скоростей промежутков под целевую длительность.
 
     Промежуток = весь маршрут МИНУС показанные окна зон (непоказанные части
-    зон тоже перематываются). Логика по спеке: сохранить обязательные зоны →
-    ускорить промежутки → если не влезает, уменьшать окна → предупреждать.
+    зон тоже перематываются). Промежутки делятся на три сорта:
+    - с людьми (subject_len — суммарное «человеческое» время маршрута):
+      перематываются щадяще, не быстрее ×_SUBJECT_GAP_MAX — ускоренный
+      танцор выглядит категорически плохо;
+    - «замёрзшие» паузы (frozen_len — картинка не меняется): занимают в
+      ролике фиксированные frozen_out секунд, вне зависимости от длины;
+    - пустые (дрон летит между этажами): гонятся до gap_max — переход
+      между людьми должен быть минимален.
+    Логика: сохранить обязательные зоны → срезать замёрзшее → сжать пустое →
+    мягко сжать людей → если не влезает, уменьшать окна → предупреждать.
     """
     cfg = STYLES.get(style, STYLES["smooth"])
     w_min, w_max = cfg["window"]
@@ -383,29 +506,56 @@ def solve_timing(zone_lens: list[float], route_len: float,
     gap_max = cfg["gap_max"]
     warnings: list[str] = []
 
-    def parts(w: float) -> tuple[float, float]:
+    def parts(w: float) -> tuple[float, float, float]:
+        """(экранное время зон, пустой промежуток, промежуток с людьми).
+        Окна зон лежат на людях (их так выбирают) — показанное время
+        вычитается из «человеческого». Замёрзшие паузы исключаются из
+        пустого промежутка: их экранное время фиксировано (frozen_out)."""
         shown = sum(min(w, zl) for zl in zone_lens)
-        return shown / z_speed, max(route_len - shown, 0.0)
+        gap_total = max(route_len - shown, 0.0)
+        subj_gap = min(max(subject_len - shown, 0.0), gap_total)
+        frozen = min(frozen_len, gap_total - subj_gap)
+        return shown / z_speed, gap_total - subj_gap - frozen, subj_gap
 
     for w in np.arange(w_max, w_min - 0.01, -0.5):
-        zone_out, gap_total = parts(float(w))
-        rest = target - zone_out
+        zone_out, empty_gap, subj_gap = parts(float(w))
+        rest = target - zone_out - frozen_out
         if rest <= 0:
             continue  # одни зоны уже не влезают — уменьшаем окно дальше
-        gap_speed = max(gap_total / rest, _MIN_GAP_SPEED) if gap_total > 0 else 1.0
-        if gap_speed <= gap_max:
+        # пустые промежутки жмём в первую очередь — их не жалко
+        t_empty_min = empty_gap / gap_max
+        t_subj = rest - t_empty_min
+        if subj_gap > 0:
+            if t_subj <= 0:
+                continue
+            s_subj = max(subj_gap / t_subj, _MIN_GAP_SPEED)
+            if s_subj > _SUBJECT_GAP_MAX:
+                continue  # людей пришлось бы гнать слишком быстро
+        else:
+            s_subj = 1.0
+        # запас времени отдаём пустым промежуткам — не гоним их зря
+        t_subj_used = subj_gap / s_subj
+        s_empty = (empty_gap / max(rest - t_subj_used, 1e-9)
+                   if empty_gap > 0 else 1.0)
+        s_empty = min(max(s_empty, _MIN_GAP_SPEED), gap_max)
+        if zone_out + frozen_out + t_subj_used + empty_gap / s_empty <= target + 1.0:
             return TimingSolution(round(float(w), 2), z_speed,
-                                  round(float(gap_speed), 2), True, [])
+                                  round(float(s_empty), 2), True, [],
+                                  round(float(s_subj), 2))
 
-    # Не влезло даже при минимальных окнах и максимальном ускорении
-    zone_out, gap_total = parts(w_min)
-    total = zone_out + gap_total / gap_max
+    # Не влезло даже при минимальных окнах и максимальных ускорениях
+    zone_out, empty_gap, subj_gap = parts(w_min)
+    total = (zone_out + frozen_out + empty_gap / gap_max
+             + subj_gap / _SUBJECT_GAP_MAX)
     warnings.append(
         f"Тайминг {target:.0f}с слишком короткий: {len(zone_lens)} обязательных "
-        f"зон + маршрут займут минимум ~{total:.0f}с. Варианты: увеличить "
-        f"длительность ролика; снять отметку с части зон; выбрать стиль "
-        f"«динамичный» (сильнее ускоряет); согласиться с {total:.0f}с.")
-    return TimingSolution(round(float(w_min), 2), z_speed, gap_max, False, warnings)
+        f"зон + маршрут займут минимум ~{total:.0f}с (кадры с людьми не "
+        f"перематываются быстрее ×{_SUBJECT_GAP_MAX:g} — танец должен остаться "
+        f"смотрибельным). Варианты: увеличить длительность ролика; снять "
+        f"отметку с части зон; выбрать стиль «динамичный» (сильнее ускоряет); "
+        f"согласиться с {total:.0f}с.")
+    return TimingSolution(round(float(w_min), 2), z_speed, gap_max, False,
+                          warnings, _SUBJECT_GAP_MAX)
 
 
 # ─────────────────────────── План ───────────────────────────
@@ -455,14 +605,65 @@ def build_fpv_plan(storage, project: Project, video: SourceVideo,
         for tz in technical_zones)
     route_len = (route_end - route_start) - technical_span
 
+    # «Человеческое» время маршрута: эти куски перематываются щадяще
+    # (≤×_SUBJECT_GAP_MAX), пустые — быстро. Технические не считаем: они
+    # вырезаются целиком.
+    subject_cache: dict = {}
+    subject_spans = _subject_spans(scenes, subject_cache)
+
+    def _span_len_in_route(lo: float, hi: float) -> float:
+        """Длина куска внутри маршрута за вычетом технических зон."""
+        lo, hi = max(lo, route_start), min(hi, route_end)
+        if lo >= hi:
+            return 0.0
+        seg_len = hi - lo
+        for tz in technical_zones:
+            seg_len -= max(0.0, min(hi, tz.end) - max(lo, tz.start))
+        return max(seg_len, 0.0)
+
+    # «Замёрзшие» паузы (картинка не меняется): каждая занимает в ролике
+    # не больше project.fpv_pause_out секунд — правило пользователя.
+    # Основной детектор — пофреймовая разница картинки (точные границы,
+    # не зависит от классификации сцен и CV-людей); сценный — дополнение.
+    pause_out = max(float(project.fpv_pause_out or 0.5), 0.1)
+    # короче фейда сегмент нельзя: crossfade-цепочка ломается на офсетах
+    pause_out = max(pause_out, style["fade"] + 0.1)
+    frozen_raw = list(_frozen_spans(scenes, subject_cache))
+    profile_spans = _frozen_spans_profile(video.path, route_start, route_end)
+    if profile_spans:
+        frozen_raw += profile_spans
+    frozen_spans = [(lo, hi) for lo, hi in _merge_spans(frozen_raw)
+                    if _span_len_in_route(lo, hi) >= _FREEZE_MIN_LEN]
+    frozen_len = sum(_span_len_in_route(lo, hi) for lo, hi in frozen_spans)
+
+    def _frozen_overlap(lo: float, hi: float) -> float:
+        return sum(max(0.0, min(hi, fh) - max(lo, fl))
+                   for fl, fh in frozen_spans)
+
+    # «Человеческое» время не должно включать паузы: замер главнее —
+    # ложный «человек» от CV в пустом замершем кадре не спасает паузу
+    subject_len = sum(
+        max(_span_len_in_route(lo, hi) - _frozen_overlap(lo, hi), 0.0)
+        for lo, hi in subject_spans)
+
+    # Зона, почти целиком лежащая на паузе (ложный «сюжет» на замершем
+    # кадре), не показывается на нормальной скорости — уходит в перемотку
+    # и сжимается как пауза. Все зоны на паузах — краевой случай, оставляем.
+    unfrozen = [z for z in required
+                if _frozen_overlap(z.start, z.end) < 0.7 * z.duration]
+    if unfrozen:
+        required = unfrozen
+
     sol = solve_timing([z.duration for z in required], route_len,
-                       project.target_duration, project.fpv_style)
+                       project.target_duration, project.fpv_style,
+                       subject_len=subject_len,
+                       frozen_len=frozen_len,
+                       frozen_out=pause_out * len(frozen_spans))
 
     # Позиция окна внутри зоны — плавный участок (плотный профиль движения)
     # И одновременно самый «интересный» (танцующий человек, красивая деталь):
     # смаз/рывок штрафуется жёстко, интересность — тай-брейк среди плавных.
     profile = motion_profile(video.path, route_start, route_end)
-    subject_cache: dict = {}
 
     def best_window(z: Zone, w: float) -> tuple[float, float]:
         w = min(w, z.duration)
@@ -478,7 +679,8 @@ def build_fpv_plan(storage, project: Project, video: SourceVideo,
                 ok, bad = window_motion_ok(times, vecs, st, st + w)
                 motion_bad = bad if ok else bad + 50  # дёрганое — в конец очереди
             interest = _window_interest(scenes, st, st + w, subject_cache)
-            score = motion_bad - 8.0 * interest  # среди плавных выигрывает интересное
+            frozen_frac = _frozen_overlap(st, st + w) / w  # окно на паузе — зря
+            score = (motion_bad - 8.0 * interest + 40.0 * frozen_frac)
             if score < best_score:
                 best, best_score = float(st), score
         return round(best, 3), round(best + w, 3)
@@ -498,16 +700,50 @@ def build_fpv_plan(storage, project: Project, video: SourceVideo,
         return scenes[-1]
 
     def add_gap(a: float, b: float, label: str):
-        """Перемотка [a,b), с вырезанными кусками технических зон — они не
-        должны появляться в ролике ни на какой скорости."""
+        """Перемотка [a,b): технические зоны вырезаны совсем; куски с людьми
+        перематываются щадяще (subject_gap_speed); «замёрзшие» паузы
+        сжимаются до pause_out экранных секунд; пустые — быстро."""
         nonlocal order
         for lo, hi in _split_excluding_technical(a, b, technical_zones):
-            plan.segments.append(PlanSegment(
-                scene_id=scene_at(lo).id, order=order,
-                src_start=round(lo, 3), src_end=round(hi, 3),
-                slot=label, speed=sol.gap_speed, crop="smart",
-                reason=f"перемотка ×{sol.gap_speed:g} по маршруту"))
-            order += 1
+            # 1) паузы главнее людей: замер картинки честнее CV-детекции —
+            # ложный «человек» в пустом кадре не должен спасать паузу;
+            # 2) остальное делится на «с людьми» и «пустое»
+            pieces: list[list] = []   # [lo, hi, kind: subject|frozen|empty]
+            for flo, fhi, frozen in _split_by_subject(lo, hi, frozen_spans):
+                if frozen:
+                    pieces.append([flo, fhi, "frozen"])
+                    continue
+                for plo, phi, subj in _split_by_subject(flo, fhi, subject_spans):
+                    pieces.append([plo, phi, "subject" if subj else "empty"])
+            # микрокуски приклеиваем к соседу — не плодим сегменты
+            merged: list[list] = []
+            for plo, phi, kind in pieces:
+                if merged and phi - plo < _MIN_GAP_LEN:
+                    merged[-1][1] = phi
+                else:
+                    merged.append([plo, phi, kind])
+            if len(merged) > 1 and merged[0][1] - merged[0][0] < _MIN_GAP_LEN:
+                merged[1][0] = merged[0][0]
+                merged.pop(0)
+            for plo, phi, kind in merged:
+                if kind == "frozen":
+                    # вся пауза → pause_out экранных секунд, но не медленнее
+                    # обычной перемотки пустых участков
+                    speed = max((phi - plo) / pause_out, sol.gap_speed)
+                    reason = (f"статичная пауза {phi - plo:.0f}с — сжата "
+                              f"до {pause_out:g}с")
+                elif kind == "subject":
+                    speed = sol.subject_gap_speed
+                    reason = f"щадящая перемотка ×{speed:g} — в кадре люди"
+                else:
+                    speed = sol.gap_speed
+                    reason = f"перемотка ×{speed:g} по маршруту"
+                plan.segments.append(PlanSegment(
+                    scene_id=scene_at(plo).id, order=order,
+                    src_start=round(plo, 3), src_end=round(phi, 3),
+                    slot=label, speed=round(speed, 2), crop="smart",
+                    reason=reason))
+                order += 1
 
     order = 0
     cursor = route_start

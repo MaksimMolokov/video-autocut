@@ -390,3 +390,100 @@ def test_plan_selects_music_cue():
     assert plan.music_offset >= 0.0
     assert plan.music_offset <= 60.0 - plan.total_duration + 0.01
     assert plan.music_fade_in > 0 and plan.music_fade_out > 0
+
+
+# --- Кэш LLM-ранжирования (пересборка не гоняет LLM повторно) ---
+
+def _fake_llm(calls):
+    """Стаб LLMAnalyzer: считает вызовы, всем сценам match=0.9."""
+    import json as _json
+    from types import SimpleNamespace
+
+    def create(**kw):
+        calls.append(1)
+        batch = _json.loads(kw["messages"][1]["content"].split("Сцены:\n")[1])
+        payload = {"scores": [{"id": c["id"], "match": 0.9} for c in batch]}
+        msg = SimpleNamespace(content=_json.dumps(payload))
+        return SimpleNamespace(choices=[SimpleNamespace(message=msg)])
+
+    client = SimpleNamespace(chat=SimpleNamespace(
+        completions=SimpleNamespace(create=create)))
+    return SimpleNamespace(model="fake", client=client,
+                           is_available=lambda: True)
+
+
+def test_llm_rank_cached_by_scenario(storage, monkeypatch):
+    from core import montage_planner as mp
+    calls: list = []
+    monkeypatch.setattr(mp, "LLMAnalyzer", lambda: _fake_llm(calls))
+
+    scenes = _library(6)
+    for s in scenes:
+        s.project_id = "p1"
+        storage.save_scene(s)
+
+    assert mp._llm_rank("сценарий про океан", scenes, storage)
+    assert len(calls) == 1
+    assert all(s.scenario_match_score == 0.9 for s in scenes)
+    assert all(s.scenario_match_key for s in scenes)
+    # скор сохранён в БД
+    assert storage.get_scene(scenes[0].id).scenario_match_key
+
+    # тот же сценарий, сцены перечитаны из БД → LLM не вызывается
+    again = [storage.get_scene(s.id) for s in scenes]
+    assert mp._llm_rank("сценарий про океан", again, storage)
+    assert len(calls) == 1
+
+    # другой сценарий → пересчёт
+    assert mp._llm_rank("сценарий про горы", again, storage)
+    assert len(calls) == 2
+
+
+def test_llm_refill_resets_rank_cache(storage, monkeypatch):
+    """Новое описание сцены сбрасывает кэш ранжирования."""
+    from core.llm_analyzer import LLMAnalyzer
+    scene = _scene()
+    scene.scenario_match_key = "старыйключ"
+    monkeypatch.setattr(
+        LLMAnalyzer, "analyze_frame",
+        lambda self, fp: {"scene_description": "x", "objects": [],
+                          "people_count": 0, "emotions": [], "composition": "",
+                          "lighting": "", "aesthetic_score": 0.5,
+                          "scene_type": "location", "recommended_slot": "main",
+                          "tags": [], "usable_for_edit": True,
+                          "subject_x": 0.5, "subject_y": 0.5})
+    assert LLMAnalyzer().fill_scene(scene, None)
+    assert scene.scenario_match_key == ""
+
+
+# --- Персистентный кэш профиля движения ---
+
+def test_motion_profile_persisted_to_disk(storage, smooth_pan_video, monkeypatch):
+    """Профиль считается один раз, сохраняется в npz и читается с диска."""
+    from core import frame_quality as fq
+    from core.montage_planner import _pick_best_window, _profile_path
+
+    scene = Scene(project_id="prof-test", video_id="v",
+                  video_path=str(smooth_pan_video), start=0.0, end=4.0)
+    win = _pick_best_window(scene, 2.0, [], _cache={})
+    assert win is not None
+    pf = _profile_path(scene)
+    assert pf is not None and pf.exists()
+
+    # повторный вызов (свежий in-memory кэш) обязан читать npz, а не ffmpeg
+    monkeypatch.setattr(fq, "motion_profile",
+                        lambda *a: pytest.fail("профиль должен читаться с диска"))
+    assert _pick_best_window(scene, 2.0, [], _cache={}) == win
+
+
+def test_motion_profile_corrupt_cache_rebuilt(storage, smooth_pan_video):
+    """Битый npz не роняет планировщик — профиль пересчитывается."""
+    from core.montage_planner import _pick_best_window, _profile_path
+    scene = Scene(project_id="prof-corrupt", video_id="v",
+                  video_path=str(smooth_pan_video), start=0.0, end=4.0)
+    pf = _profile_path(scene)
+    pf.parent.mkdir(parents=True, exist_ok=True)
+    pf.write_bytes(b"not-a-npz")
+    win = _pick_best_window(scene, 2.0, [], _cache={})
+    assert win is not None
+    assert pf.exists()  # пересохранён валидным

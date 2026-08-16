@@ -113,7 +113,7 @@ def cmd_plan(args):
 
     scenes = storage.list_scenes(project.id)
     plan = build_plan(project, scenes, music, use_llm=not args.no_llm,
-                      variant=args.variant)
+                      variant=args.variant, storage=storage)
     storage.save_plan(plan)
     project.status = "planned"
     storage.save_project(project)

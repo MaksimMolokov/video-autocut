@@ -175,3 +175,44 @@ def test_replace_segment_resyncs_beats(storage, project_with_plan):
     assert replaced.beat_synced
     # конец сегмента подтянут: 2.5 (конец первого) + длительность = 4.6
     assert abs((2.5 + replaced.duration) - 4.6) < 0.01
+
+
+def test_encoder_args_hw_and_fallback(monkeypatch):
+    """HW_ENCODE + доступный VideoToolbox → аппаратный кодек; иначе libx264."""
+    import config
+    from core import renderer as r
+
+    monkeypatch.setattr(r, "_HW_ENCODER", "h264_videotoolbox")
+    monkeypatch.setattr(config, "HW_ENCODE", True)
+    args = r._encoder_args(final=False)
+    assert "h264_videotoolbox" in args and "yuv420p" in args
+
+    monkeypatch.setattr(config, "HW_ENCODE", False)
+    args = r._encoder_args(final=True)
+    assert "libx264" in args and "18" in args
+
+    # ffmpeg без videotoolbox → fallback даже при HW_ENCODE=True
+    monkeypatch.setattr(config, "HW_ENCODE", True)
+    monkeypatch.setattr(r, "_HW_ENCODER", "")
+    assert "libx264" in r._encoder_args(final=False)
+
+
+def test_crossfade_survives_short_segment(storage, project_with_plan):
+    """Сегмент короче фейда (сжатая пауза 0.4с) не ломает xfade-цепочку:
+    фейд ужимается, рендер успешен, все сегменты в ролике."""
+    project, plan, _ = project_with_plan
+    from core.models import PlanSegment
+    scene = storage.get_scene(plan.segments[0].scene_id)
+    plan.segments.append(PlanSegment(
+        scene_id=scene.id, order=2, src_start=6.5, src_end=6.9,
+        slot="пауза", speed=1.0))
+    plan.transition = "crossfade"
+    plan.transition_duration = 0.5   # больше, чем сегмент 0.4с
+    out = render_plan(storage, project, plan, final=False, progress=lambda m: None)
+    assert out and out.exists()
+    dur = float(subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "csv=p=0", str(out)], capture_output=True, text=True).stdout.strip())
+    # фейд ужат до 0.4*0.45=0.18 → длительность = 5.9 - 2*0.18 ≈ 5.54
+    expected = plan.total_duration - 2 * (0.4 * 0.45)
+    assert abs(dur - expected) < 0.4

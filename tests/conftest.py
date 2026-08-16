@@ -111,6 +111,23 @@ def mixed_motion_video(media_dir: Path) -> Path:
     return out
 
 
+@pytest.fixture(scope="session")
+def freeze_video(media_dir: Path) -> Path:
+    """11 секунд: движение (0–3с) → полностью замершая картинка (3–8с,
+    freezeframes повторяет один кадр) → снова движение (8–11с)."""
+    out = media_dir / "freeze.mp4"
+    subprocess.run(
+        ["ffmpeg", "-y", "-v", "error",
+         "-f", "lavfi", "-i", "testsrc2=duration=11:size=640x360:rate=30",
+         "-filter_complex",
+         "[0:v]split[a][b];[a][b]freezeframes=first=90:last=239:replace=90",
+         "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+         str(out)],
+        check=True, capture_output=True,
+    )
+    return out
+
+
 @pytest.fixture()
 def storage(tmp_path, monkeypatch) -> Storage:
     """Изолированное хранилище: и БД, и папки проектов — во временной директории."""

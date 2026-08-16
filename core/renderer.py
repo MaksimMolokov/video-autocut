@@ -81,6 +81,30 @@ def _target_fps(storage: Storage, plan: MontagePlan) -> int:
     return 30
 
 
+_HW_ENCODER = None  # определяется один раз: есть ли h264_videotoolbox
+
+
+def _hw_encoder() -> str:
+    """Аппаратный H.264-энкодер ffmpeg (VideoToolbox на Mac), '' — нет."""
+    global _HW_ENCODER
+    if _HW_ENCODER is None:
+        res = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
+                             capture_output=True, text=True)
+        _HW_ENCODER = ("h264_videotoolbox"
+                       if "h264_videotoolbox" in res.stdout else "")
+    return _HW_ENCODER
+
+
+def _encoder_args(final: bool) -> list[str]:
+    """Видеокодек рендера. VideoToolbox кодирует в разы быстрее libx264;
+    -q:v — constant quality (работает на Apple Silicon). Fallback — libx264."""
+    if config.HW_ENCODE and _hw_encoder():
+        return ["-c:v", _hw_encoder(), "-q:v", "70" if final else "45",
+                "-pix_fmt", "yuv420p"]
+    return (["-c:v", "libx264", "-preset", "medium", "-crf", "18"] if final
+            else ["-c:v", "libx264", "-preset", "veryfast", "-crf", "28"])
+
+
 _STAB_FILTER = None  # определяется один раз: vidstab (лучше) или deshake
 
 
@@ -117,8 +141,7 @@ def render_plan(storage: Storage, project: Project, plan: MontagePlan,
     w, h = config.ASPECTS[project.aspect]
     if not final:  # preview — половинное разрешение
         w, h = w // 2, h // 2
-    quality = ["-preset", "medium", "-crf", "18"] if final \
-        else ["-preset", "veryfast", "-crf", "28"]
+    codec = _encoder_args(final)
 
     seg_cache = pdir / "cache" / "segments"
     seg_cache.mkdir(parents=True, exist_ok=True)
@@ -143,7 +166,8 @@ def render_plan(storage: Storage, project: Project, plan: MontagePlan,
             f"{seg.scene_id}:{seg.src_start:.3f}:{seg.src_end:.3f}:"
             f"{w}x{h}@{out_fps}:{'f' if final else 'p'}:{cw}x{ch}+{x}+{y}"
             f"{':stab' if stab else ''}"
-            f"{f':x{seg.speed:g}' if seg.speed != 1.0 else ''}".encode()
+            f"{f':x{seg.speed:g}' if seg.speed != 1.0 else ''}"
+            f":{codec[1]}".encode()
         ).hexdigest()[:16]
         part = seg_cache / f"{key}.mp4"
 
@@ -179,7 +203,7 @@ def render_plan(storage: Storage, project: Project, plan: MontagePlan,
             "ffmpeg", "-y", "-v", "error",
             "-ss", f"{seg.src_start:.3f}", "-i", scene.video_path,
             "-t", f"{seg.duration:.3f}",
-            "-vf", vf, "-c:v", "libx264", *quality,
+            "-vf", vf, *codec,
             "-an", "-movflags", "+faststart", str(part),
         ]
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
@@ -203,6 +227,9 @@ def render_plan(storage: Storage, project: Project, plan: MontagePlan,
     fade_d = plan.transition_duration
     use_xfade = plan.transition == "crossfade" and fade_d > 0 and len(parts) > 1
     if use_xfade:
+        # сегмент короче фейда ломает офсеты xfade-цепочки (офсет уезжает
+        # назад) — фейд ужимается под самый короткий сегмент
+        fade_d = min(fade_d, min(part_durs) * 0.45)
         progress(f"  склейка crossfade {fade_d:.1f}s…")
         inputs: list[str] = []
         for p in parts:
@@ -217,7 +244,7 @@ def render_plan(storage: Storage, project: Project, plan: MontagePlan,
         res = subprocess.run(
             ["ffmpeg", "-y", "-v", "error", *inputs,
              "-filter_complex", ";".join(filters), "-map", prev,
-             "-c:v", "libx264", *quality, "-movflags", "+faststart", str(silent)],
+             *codec, "-movflags", "+faststart", str(silent)],
             capture_output=True, text=True, timeout=900,
         )
         rendered_total = sum(part_durs) - (len(parts) - 1) * fade_d

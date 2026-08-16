@@ -435,3 +435,351 @@ def test_segment_out_duration():
                       slot="переезд", speed=3.0)
     assert seg.duration == 12.0        # в исходнике
     assert seg.out_duration == 4.0     # в ролике
+
+
+# ─────────── танцор не перематывается, пустой завис — перематывается ───────────
+
+def test_timing_subject_gaps_gentler_than_empty():
+    """Промежутки с людьми ≤×3 (щадяще), пустые гонятся быстрее."""
+    sol = solve_timing([10] * 3, 120.0, 40.0, "smooth", subject_len=40.0)
+    assert sol.fits
+    assert 1.0 <= sol.subject_gap_speed <= 3.0
+    assert sol.gap_speed >= sol.subject_gap_speed
+    # длительность сходится: зоны + люди + пустое ≈ target
+    shown = 3 * min(sol.window, 10)
+    subj_gap = max(40.0 - shown, 0.0)
+    empty_gap = 120.0 - shown - subj_gap
+    total = shown + subj_gap / sol.subject_gap_speed + empty_gap / sol.gap_speed
+    assert abs(total - 40.0) <= 2.0
+
+
+def test_timing_without_people_unchanged():
+    """subject_len=0 (пустая локация) — поведение как раньше, одна скорость."""
+    sol = solve_timing([20] * 6, 300.0, 60.0, "smooth")
+    assert sol.fits and sol.subject_gap_speed == 1.0
+
+
+def test_timing_warns_because_people_cannot_be_rushed():
+    """Люди занимают почти весь маршрут, target мал — честное предупреждение
+    (танец не гонится быстрее ×3 ради тайминга)."""
+    sol = solve_timing([10] * 3, 120.0, 20.0, "smooth", subject_len=110.0)
+    assert not sol.fits
+    assert "не перематываются быстрее" in sol.warnings[0]
+    assert sol.subject_gap_speed <= 3.0
+
+
+def test_interest_score_person_beats_prettier_empty_frame():
+    """Человек в кадре доминирует: танцор обыгрывает БОЛЕЕ красивый и
+    БОЛЕЕ качественный пустой кадр (прямая репродукция жалобы: сюжетом
+    становился красивый завис, а танец уезжал в перемотку)."""
+    from core.fpv import _interest_score
+    pretty_empty = Scene(video_id="v", video_path="/x.mp4", start=0, end=10,
+                         aesthetic_score=0.95, quality_score=0.95,
+                         people_count=0, motion="slow")
+    dancer = Scene(video_id="v", video_path="/x.mp4", start=0, end=10,
+                   aesthetic_score=0.3, quality_score=0.4,
+                   people_count=1, motion="fast")
+    assert _interest_score(dancer) > _interest_score(pretty_empty)
+
+
+def test_auto_zones_prefer_people_when_route_has_them():
+    """Если на маршруте есть люди — «моменты» ставятся только на людей;
+    полосы с красивыми, но пустыми кадрами уходят в перемотку."""
+    from core.fpv import _auto_zones
+    project = Project(name="p", target_duration=60)
+    video = SourceVideo(project_id="p", path="/x.mp4")
+    scenes = []
+    for i in range(6):
+        with_person = i in (1, 4)
+        scenes.append(Scene(
+            video_id="v", video_path="/x.mp4",
+            start=i * 10.0, end=(i + 1) * 10.0,
+            aesthetic_score=0.4 if with_person else 0.9,  # пустые красивее!
+            quality_score=0.5 if with_person else 0.9,
+            people_count=1 if with_person else 0, motion="slow"))
+    zones = _auto_zones(project, video, scenes, 0.0, 60.0)
+    assert zones
+    for z in zones:
+        assert z.start in (10.0, 40.0), \
+            f"зона {z.start}-{z.end} стоит на пустом кадре"
+
+
+def test_fpv_dancer_normal_speed_hover_fast_forwarded(storage, synthetic_video,
+                                                      monkeypatch):
+    """Сквозная репродукция жалобы: танец 20–60с, вокруг — пустые пролёты
+    и зависания. Требования:
+    1) нормальная скорость — только на танце;
+    2) перемотка ПО танцу щадящая (≤×3) — чередование «показ/мягкая
+       перемотка» внутри танца;
+    3) пустые участки гонятся быстрее — переход между людьми минимален."""
+    import core.frame_quality as fq_mod
+    import core.smart_crop as sc_mod
+    monkeypatch.setattr(fq_mod, "motion_profile", lambda *a, **k: None)
+    monkeypatch.setattr(sc_mod, "find_focus", lambda *a, **k: None)
+
+    project = Project(name="dance-hover", target_duration=40, fpv_style="smooth")
+    storage.save_project(project)
+    video = SourceVideo(project_id=project.id, path=str(synthetic_video),
+                        duration=120.0, fps=30, width=640, height=360,
+                        fpv_showroom=True, valid=True)
+    storage.save_video(video)
+    scenes = []
+    for i in range(12):
+        dancing = 2 <= i <= 5  # 20–60с — танец
+        scenes.append(Scene(
+            project_id=project.id, video_id=video.id,
+            video_path=str(synthetic_video),
+            start=i * 10.0, end=(i + 1) * 10.0,
+            # завис/пролёт технически «чище» и «красивее» танца — раньше
+            # это делало его сюжетом, а танцора отправляло в перемотку
+            quality_score=0.5 if dancing else 0.9,
+            aesthetic_score=0.4 if dancing else 0.8,
+            people_count=1 if dancing else 0,
+            motion="fast" if dancing else "static",
+            llm_status="done", description="танец" if dancing else "пусто"))
+    storage.save_scenes(scenes)
+    storage.save_zone(Zone(project_id=project.id, video_id=video.id,
+                           start=0.0, end=120.0, title="маршрут",
+                           required=True, technical=False))
+
+    plan = build_fpv_plan(storage, project, video)
+
+    # 1. все нормально-скоростные окна лежат на танце
+    normal = [s for s in plan.segments if s.speed == 1.0]
+    assert normal, "нет ни одного нормально-скоростного окна"
+    for seg in normal:
+        assert seg.src_start >= 19.5 and seg.src_end <= 60.5, \
+            f"нормальная скорость на пустом кадре {seg.src_start}-{seg.src_end}"
+
+    # 2. перемотка по танцу щадящая
+    for seg in plan.segments:
+        overlap = min(seg.src_end, 60.0) - max(seg.src_start, 20.0)
+        if overlap > 0.5 and seg.speed > 1.0:
+            assert seg.speed <= 3.01, \
+                f"танец перемотан ×{seg.speed} ({seg.src_start}-{seg.src_end})"
+
+    # 3. пустые участки гонятся быстрее любых «человеческих» перемоток
+    empty_gaps = [s for s in plan.segments if s.speed > 1.0
+                  and (s.src_end <= 20.5 or s.src_start >= 59.5)]
+    assert empty_gaps, "пустые участки должны перематываться"
+    dance_gaps = [s for s in plan.segments if s.speed > 1.0
+                  and s.src_start >= 19.5 and s.src_end <= 60.5]
+    if dance_gaps:
+        assert (max(g.speed for g in empty_gaps)
+                >= max(g.speed for g in dance_gaps))
+
+    # маршрут по-прежнему строго по порядку и укладывается в тайминг
+    starts = [s.src_start for s in plan.segments]
+    assert starts == sorted(starts)
+    assert abs(plan.total_duration - 40.0) <= 4.0
+
+
+# ─────────── «замёрзшие» паузы: картинка не меняется → сжатие до 0.5с ───────────
+
+def test_frozen_spans_detection():
+    """Подряд идущие статичные сцены без людей группируются в паузу;
+    короткая статика и статика с человеком паузой не считаются."""
+    from core.fpv import _frozen_spans
+    scenes = [
+        Scene(video_id="v", video_path="/x.mp4", start=0, end=10,
+              motion="slow", people_count=0),                    # движение
+        Scene(video_id="v", video_path="/x.mp4", start=10, end=20,
+              motion="static", people_count=0),                  # пауза…
+        Scene(video_id="v", video_path="/x.mp4", start=20, end=30,
+              motion="static", people_count=0),                  # …продолжается
+        Scene(video_id="v", video_path="/x.mp4", start=30, end=40,
+              motion="static", people_count=1),                  # человек стоит — не пауза
+        Scene(video_id="v", video_path="/x.mp4", start=40, end=42,
+              motion="static", people_count=0),                  # 2с — короче порога
+    ]
+    spans = _frozen_spans(scenes, cache={})
+    assert spans == [(10.0, 30.0)]
+
+
+def test_timing_frozen_pause_takes_fixed_time():
+    """Замёрзшая пауза занимает фиксированное экранное время, освобождая
+    бюджет: без учёта заморозки этот тайминг был бы на грани."""
+    # маршрут 120с: зоны 3×10, люди 40с, замёрзшая пауза 40с (одна)
+    sol = solve_timing([10] * 3, 120.0, 40.0, "smooth",
+                       subject_len=40.0, frozen_len=40.0, frozen_out=0.5)
+    assert sol.fits
+    shown = 3 * min(sol.window, 10)
+    subj_gap = max(40.0 - shown, 0.0)
+    empty_gap = 120.0 - shown - subj_gap - 40.0
+    total = (shown + 0.5 + subj_gap / sol.subject_gap_speed
+             + empty_gap / sol.gap_speed)
+    assert abs(total - 40.0) <= 2.0
+
+
+def test_fpv_frozen_pause_compressed_to_setting(storage, synthetic_video,
+                                                monkeypatch):
+    """Правило пользователя: длинный статичный кусок (дрон завис между
+    этажами, картинка не меняется) занимает в ролике не больше
+    fpv_pause_out секунд (по умолчанию 0.5с + защита от фейда)."""
+    import core.frame_quality as fq_mod
+    import core.smart_crop as sc_mod
+    monkeypatch.setattr(fq_mod, "motion_profile", lambda *a, **k: None)
+    monkeypatch.setattr(sc_mod, "find_focus", lambda *a, **k: None)
+    monkeypatch.setattr(fq_mod, "change_profile", lambda *a, **k: None)
+
+    project = Project(name="frozen", target_duration=30, fpv_style="smooth")
+    storage.save_project(project)
+    video = SourceVideo(project_id=project.id, path=str(synthetic_video),
+                        duration=100.0, fps=30, width=640, height=360,
+                        fpv_showroom=True, valid=True)
+    storage.save_video(video)
+    scenes = []
+    for i in range(10):
+        dancing = i <= 2 or i >= 7        # 0-30 и 70-100 — танец
+        hovering = 3 <= i <= 6            # 30-70 — завис, картинка не меняется
+        scenes.append(Scene(
+            project_id=project.id, video_id=video.id,
+            video_path=str(synthetic_video),
+            start=i * 10.0, end=(i + 1) * 10.0,
+            quality_score=0.9 if hovering else 0.5,
+            aesthetic_score=0.7 if hovering else 0.4,
+            people_count=1 if dancing else 0,
+            motion="static" if hovering else "fast",
+            llm_status="done"))
+    storage.save_scenes(scenes)
+    storage.save_zone(Zone(project_id=project.id, video_id=video.id,
+                           start=0.0, end=100.0, title="маршрут",
+                           required=True, technical=False))
+
+    plan = build_fpv_plan(storage, project, video)
+
+    # завис 30-70с присутствует в ролике (не вырезан), но суммарно
+    # занимает не больше паузы из настройки (+ защита от фейда: 0.6с)
+    frozen_segs = [s for s in plan.segments
+                   if s.src_start >= 29.0 and s.src_end <= 71.0 and s.speed > 3.5]
+    assert frozen_segs, "статичная пауза должна быть сжата суперскоростью"
+    frozen_out = sum(s.out_duration for s in frozen_segs)
+    assert frozen_out <= 1.0, f"пауза заняла {frozen_out:.2f}с в ролике"
+    # маршрут непрерывен: завис не вырезан, а перемотан
+    covered = sorted((s.src_start, s.src_end) for s in plan.segments)
+    for a, b in zip(covered, covered[1:]):
+        assert b[0] >= a[1] - 0.01
+    # нормальная скорость — только на танце
+    for seg in plan.segments:
+        if seg.speed == 1.0:
+            assert seg.src_end <= 30.5 or seg.src_start >= 69.5
+
+
+def test_fpv_pause_setting_respected(storage, synthetic_video, monkeypatch):
+    """fpv_pause_out из настроек проекта управляет длительностью паузы."""
+    import core.frame_quality as fq_mod
+    import core.smart_crop as sc_mod
+    monkeypatch.setattr(fq_mod, "motion_profile", lambda *a, **k: None)
+    monkeypatch.setattr(sc_mod, "find_focus", lambda *a, **k: None)
+    monkeypatch.setattr(fq_mod, "change_profile", lambda *a, **k: None)
+
+    project = Project(name="frozen2", target_duration=30, fpv_style="smooth",
+                      fpv_pause_out=2.0)
+    storage.save_project(project)
+    video = SourceVideo(project_id=project.id, path=str(synthetic_video),
+                        duration=100.0, fps=30, width=640, height=360,
+                        fpv_showroom=True, valid=True)
+    storage.save_video(video)
+    scenes = []
+    for i in range(10):
+        hovering = 3 <= i <= 6
+        scenes.append(Scene(
+            project_id=project.id, video_id=video.id,
+            video_path=str(synthetic_video),
+            start=i * 10.0, end=(i + 1) * 10.0,
+            quality_score=0.6, aesthetic_score=0.5,
+            people_count=0 if hovering else 1,
+            motion="static" if hovering else "slow",
+            llm_status="done"))
+    storage.save_scenes(scenes)
+    storage.save_zone(Zone(project_id=project.id, video_id=video.id,
+                           start=0.0, end=100.0, title="маршрут",
+                           required=True, technical=False))
+
+    plan = build_fpv_plan(storage, project, video)
+    frozen_segs = [s for s in plan.segments
+                   if "статичная пауза" in s.reason]
+    assert frozen_segs
+    frozen_out = sum(s.out_duration for s in frozen_segs)
+    assert frozen_out <= 2.0 + 0.3
+    assert frozen_out >= 1.0  # пауза видна, а не вырезана в ноль
+
+
+# ─────────── детекция пауз по пофреймовой разнице картинки ───────────
+
+def test_frozen_spans_profile_detects_real_freeze(freeze_video):
+    """Замер на настоящем видео: 3–8с — повтор одного кадра (картинка
+    буквально не меняется) — детектор находит ровно эту паузу."""
+    from core.fpv import _frozen_spans_profile
+    spans = _frozen_spans_profile(str(freeze_video), 0.0, 11.0)
+    assert spans is not None and len(spans) == 1, f"найдено: {spans}"
+    lo, hi = spans[0]
+    assert abs(lo - 3.0) <= 1.0, f"начало паузы {lo:.2f}, ждали ~3.0"
+    assert abs(hi - 8.0) <= 1.0, f"конец паузы {hi:.2f}, ждали ~8.0"
+
+
+def test_frozen_spans_profile_no_freeze_on_motion(smooth_pan_video):
+    """На видео с непрерывным движением пауз нет."""
+    from core.fpv import _frozen_spans_profile
+    spans = _frozen_spans_profile(str(smooth_pan_video), 0.0, 4.0)
+    assert spans == []
+
+
+def test_fpv_pause_detected_by_profile_not_scene_labels(storage, synthetic_video,
+                                                        monkeypatch):
+    """Репродукция жалобы «пауза перематывается недостаточно»:
+    1) сцены паузы помечены motion='slow' (лёгкий дрейф дрона) — сценный
+       детектор её НЕ видит;
+    2) CV/LLM ложно «видят человека» в замершем кадре — раньше пауза уходила
+       в щадящую перемотку ×3 и занимала секунды.
+    Профиль изменений картинки должен пересилить и то и другое."""
+    import core.frame_quality as fq_mod
+    import core.smart_crop as sc_mod
+    import numpy as np
+    monkeypatch.setattr(fq_mod, "motion_profile", lambda *a, **k: None)
+    monkeypatch.setattr(sc_mod, "find_focus", lambda *a, **k: None)
+
+    def fake_change_profile(path, start, end):
+        times = np.arange(start, end, 1 / 8.0) + 1 / 16.0
+        diffs = np.where((times >= 30.0) & (times <= 70.0), 0.5, 10.0)
+        return times, diffs
+    monkeypatch.setattr(fq_mod, "change_profile", fake_change_profile)
+
+    project = Project(name="sneaky-pause", target_duration=30,
+                      fpv_style="smooth", fpv_pause_out=0.5)
+    storage.save_project(project)
+    video = SourceVideo(project_id=project.id, path=str(synthetic_video),
+                        duration=100.0, fps=30, width=640, height=360,
+                        fpv_showroom=True, valid=True)
+    storage.save_video(video)
+    scenes = []
+    for i in range(10):
+        pausing = 3 <= i <= 6  # 30-70с — пауза, но помечена коварно
+        scenes.append(Scene(
+            project_id=project.id, video_id=video.id,
+            video_path=str(synthetic_video),
+            start=i * 10.0, end=(i + 1) * 10.0,
+            quality_score=0.7, aesthetic_score=0.5,
+            people_count=1,                 # «человек» есть ВЕЗДЕ (ложный тоже)
+            motion="slow",                  # и никакой сцены-статики
+            llm_status="done"))
+    storage.save_scenes(scenes)
+    storage.save_zone(Zone(project_id=project.id, video_id=video.id,
+                           start=0.0, end=100.0, title="маршрут",
+                           required=True, technical=False))
+
+    plan = build_fpv_plan(storage, project, video)
+
+    # пауза 30-70с сжата: суммарное экранное время её кусков ≤ ~0.7с
+    pause_out = sum(s.out_duration for s in plan.segments
+                    if s.src_start >= 29.0 and s.src_end <= 71.0)
+    assert pause_out <= 1.0, f"пауза заняла {pause_out:.2f}с в ролике"
+    # и ни одного нормально-скоростного окна внутри паузы
+    for seg in plan.segments:
+        if seg.speed == 1.0:
+            assert seg.src_end <= 31.0 or seg.src_start >= 69.0, \
+                f"окно {seg.src_start}-{seg.src_end} стоит на паузе"
+    # маршрут непрерывен
+    covered = sorted((s.src_start, s.src_end) for s in plan.segments)
+    for a, b in zip(covered, covered[1:]):
+        assert b[0] >= a[1] - 0.01

@@ -9,6 +9,7 @@ LLM-этап отделён: если LM Studio недоступен, катал
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable
 
@@ -22,6 +23,45 @@ from core.storage import Storage
 log = logging.getLogger(__name__)
 
 ProgressCb = Callable[[str], None]
+
+
+def _analyze_range(project: Project, video, pdir: Path,
+                   rng: tuple[float, float]) -> Scene | None:
+    """Одна сцена: метрики качества, миниатюра, preview-клип, кадры для LLM.
+    None — брак (темно/мыло/хаос, ТЗ §7.2). Вызывается из пула потоков."""
+    start, end = rng
+    f = video.path
+    q = analyze_scene_quality(f, start, end)
+    if q.quality_score < config.QUALITY_REJECT_THRESHOLD:
+        return None
+    scene = Scene(
+        project_id=project.id, video_id=video.id, video_path=f,
+        start=start, end=end,
+        quality_score=q.quality_score, stability_score=q.stability_score,
+        sharpness=q.sharpness, brightness=q.brightness,
+        motion=q.motion, motion_type=q.motion_type, jerkiness=q.jerkiness,
+        best_moment=q.keyframes[0],
+        # фразы, пересекающие сцену — для аккуратных склеек
+        speech_segments=[p for p in video.speech_segments
+                         if p[1] > start and p[0] < end],
+    )
+    if q.motion_type == "shake":
+        scene.tags.append("jerky")  # дёрганая камера — маркер для каталога
+    thumb = pdir / "thumbnails" / f"{scene.id}.jpg"
+    clip = pdir / "previews" / f"{scene.id}.mp4"
+    key_t = q.keyframes[0]
+    if previews.make_thumbnail(f, key_t, thumb):
+        scene.thumbnail_path = str(thumb)
+    if previews.make_preview_clip(f, start, end, clip):
+        scene.preview_path = str(clip)
+    # кадры для LLM кэшируем сразу — пригодятся и при отложенном прогоне;
+    # длинная сцена (≥12с) получает второй кадр: модель видит развитие
+    frame = pdir / "cache" / f"{scene.id}_key.jpg"
+    previews.extract_frame(f, key_t, frame)
+    if scene.duration >= 12 and len(q.keyframes) > 1:
+        frame2 = pdir / "cache" / f"{scene.id}_key2.jpg"
+        previews.extract_frame(f, q.keyframes[-1], frame2)
+    return scene
 
 
 def analyze_project(storage: Storage, project: Project,
@@ -93,39 +133,14 @@ def analyze_project(storage: Storage, project: Project,
         ranges = scene_detector.detect_scenes(f, video.duration)
         progress(f"  найдено сцен: {len(ranges)}")
 
-        # 4. Качество + превью
-        for start, end in ranges:
-            q = analyze_scene_quality(str(f), start, end)
-            if q.quality_score < config.QUALITY_REJECT_THRESHOLD:
-                continue  # брак: темно/мыло/хаос (ТЗ §7.2 «исключение плохих участков»)
-            scene = Scene(
-                project_id=project.id, video_id=video.id, video_path=str(f),
-                start=start, end=end,
-                quality_score=q.quality_score, stability_score=q.stability_score,
-                sharpness=q.sharpness, brightness=q.brightness,
-                motion=q.motion, motion_type=q.motion_type, jerkiness=q.jerkiness,
-                best_moment=q.keyframes[0],
-                # фразы, пересекающие сцену — для аккуратных склеек
-                speech_segments=[p for p in video.speech_segments
-                                 if p[1] > start and p[0] < end],
-            )
-            if q.motion_type == "shake":
-                scene.tags.append("jerky")  # дёрганая камера — маркер для каталога
-            thumb = pdir / "thumbnails" / f"{scene.id}.jpg"
-            clip = pdir / "previews" / f"{scene.id}.mp4"
-            key_t = q.keyframes[0]
-            if previews.make_thumbnail(str(f), key_t, thumb):
-                scene.thumbnail_path = str(thumb)
-            if previews.make_preview_clip(str(f), start, end, clip):
-                scene.preview_path = str(clip)
-            # кадры для LLM кэшируем сразу — пригодятся и при отложенном прогоне;
-            # длинная сцена (≥12с) получает второй кадр: модель видит развитие
-            frame = pdir / "cache" / f"{scene.id}_key.jpg"
-            previews.extract_frame(str(f), key_t, frame)
-            if scene.duration >= 12 and len(q.keyframes) > 1:
-                frame2 = pdir / "cache" / f"{scene.id}_key2.jpg"
-                previews.extract_frame(str(f), q.keyframes[-1], frame2)
-            all_scenes.append(scene)
+        # 4. Качество + превью — параллельно: каждая сцена независима
+        # (OpenCV и ffmpeg-подпроцессы не держат GIL)
+        progress(f"  качество и превью ({len(ranges)} сцен, "
+                 f"{config.ANALYSIS_WORKERS} потоков)…")
+        with ThreadPoolExecutor(max_workers=config.ANALYSIS_WORKERS) as pool:
+            results = pool.map(
+                lambda rng: _analyze_range(project, video, pdir, rng), ranges)
+        all_scenes.extend(s for s in results if s is not None)
 
         storage.save_scenes(all_scenes)
 

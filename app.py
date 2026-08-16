@@ -663,6 +663,13 @@ elif step == "draft":
                     index=list(STYLES).index(project.fpv_style)
                     if project.fpv_style in STYLES else 0,
                     format_func=lambda k: STYLES[k]["title"], horizontal=True)
+                project.fpv_pause_out = float(st.number_input(
+                    "Статичная пауза в ролике, сек", min_value=0.2,
+                    max_value=3.0, step=0.1,
+                    value=float(project.fpv_pause_out or 0.5),
+                    help="Длинные участки, где картинка не меняется (дрон "
+                         "завис, ничего не происходит), сжимаются так, чтобы "
+                         "в ролике занимать не больше этого времени."))
                 storage.save_project(project)
             else:
                 st.caption("Сначала нажмите «Найти зоны»")
@@ -677,7 +684,8 @@ elif step == "draft":
             if project.music_path and Path(project.music_path).exists():
                 music = analyze_music_cached(storage, project.music_path)
             new_plan = build_plan(project, ready, music,
-                                  use_llm=use_llm_rank, variant=variant)
+                                  use_llm=use_llm_rank, variant=variant,
+                                  storage=storage)
             storage.save_plan(new_plan)
         with st.spinner("Рендер preview…"):
             render_plan(storage, project, new_plan, final=False, progress=lambda m: None)
